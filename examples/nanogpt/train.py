@@ -15,6 +15,9 @@ Usage:
 
     # Multi-GPU (4x), FineWeb
     torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
+
+    # If NCCL fails (no InfiniBand), try:
+    NCCL_IB_DISABLE=1 torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
 """
 
 import glob
@@ -24,6 +27,7 @@ import os
 import time
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -76,6 +80,10 @@ dtype = "bfloat16"
 # torch.compile (requires PyTorch 2.0+)
 compile_model = False
 
+# DDP backend: "nccl", "gloo", etc.
+# If NCCL fails, set NCCL_IB_DISABLE=1 or use backend="gloo"
+backend = "nccl"
+
 # -----------------------------------------------------------------------------
 # load config file if provided
 exec(open(os.path.join(os.path.dirname(__file__), "configurator.py")).read())
@@ -86,12 +94,13 @@ exec(open(os.path.join(os.path.dirname(__file__), "configurator.py")).read())
 ddp = int(os.environ.get("RANK", -1)) != -1
 
 if ddp:
-    dist.init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
+    device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
+    dist.init_process_group(backend=backend, device_id=device)
+    dist.barrier()
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
     assert gradient_accumulation_steps % ddp_world_size == 0
@@ -103,6 +112,8 @@ else:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 torch.manual_seed(seed + seed_offset)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 device_type = "cuda" if "cuda" in device else "cpu"
 
 # -----------------------------------------------------------------------------
@@ -119,8 +130,8 @@ if device_type == "cpu":
     scaler = None
 else:
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-    # GradScaler only needed for float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+    # GradScaler only needed for float16 (not bf16)
+    scaler = torch.amp.GradScaler(device_type, enabled=(dtype == "float16"))
 
 # -----------------------------------------------------------------------------
 # Data loading
@@ -137,22 +148,19 @@ if dataset == "fineweb10B":
     HEADER_SIZE = 256  # int32 count
 
     def load_fineweb_shard(path):
-        """Load a FineWeb shard, validate header, return tokens as int32 tensor."""
+        """Load a FineWeb shard, validate header, return tokens as int64 tensor."""
         header = torch.from_file(
             str(path), shared=False, size=HEADER_SIZE, dtype=torch.int32
         )
         assert header[0].item() == FINEWEB_MAGIC, f"bad magic in {path}"
         assert header[1].item() == FINEWEB_VERSION, f"bad version in {path}"
-        num_tokens = header[2].item()
+        num_tokens = int(header[2].item())
 
-        # read tokens (uint16 -> convert to int32 for embedding lookup)
-        tokens = torch.empty(num_tokens, dtype=torch.int32)
+        # read tokens (uint16 -> convert to int64 for embedding lookup)
         with open(path, "rb") as f:
             f.seek(HEADER_SIZE * 4)  # skip header (256 * 4 bytes)
-            import numpy as np
-
             buf = np.frombuffer(f.read(num_tokens * 2), dtype=np.uint16)
-            tokens[:] = torch.from_numpy(buf.astype(np.int32))
+            tokens = torch.from_numpy(buf.astype(np.int64))
 
         return tokens
 
@@ -174,7 +182,7 @@ if dataset == "fineweb10B":
     if master_process:
         print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
 
-    vocab_size = 50257  # GPT-2 vocab size
+    vocab_size = 50304  # GPT-2 vocab size rounded up for efficiency
 
 else:
     # Shakespeare char-level (legacy)
@@ -182,8 +190,8 @@ else:
     val_path = os.path.join(data_dir, "val.bin")
     meta_path = os.path.join(data_dir, "meta.json")
 
-    train_data = torch.load(train_path)
-    val_data = torch.load(val_path)
+    train_data = torch.load(train_path, weights_only=True)
+    val_data = torch.load(val_path, weights_only=True)
 
     with open(meta_path, "r") as f:
         meta = json.load(f)
@@ -231,6 +239,7 @@ model = GPT(model_config)
 model.to(device)
 
 if compile_model:
+    print("Compiling model...")
     model = torch.compile(model)
 
 if ddp:
@@ -250,8 +259,10 @@ optimizer = raw_model.configure_optimizers(
 
 
 def get_lr(it):
+    # linear warmup
     if it < warmup_iters:
-        return learning_rate * it / warmup_iters
+        return learning_rate * (it + 1) / (warmup_iters + 1)
+    # cosine decay
     if it > lr_decay_iters:
         return min_lr
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
@@ -285,13 +296,15 @@ def estimate_loss():
 iter_num = 0
 best_val_loss = 1e9
 
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 if master_process:
     print(f"Training on {device}, dtype={dtype}, DDP={ddp}")
+    print(f"  tokens per iteration: {tokens_per_iter:,}")
     if ddp:
         print(
             f"  world_size={ddp_world_size}, grad_accum_steps={gradient_accumulation_steps}"
         )
-    print(f"  model params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  model params: {sum(p.numel() for p in raw_model.parameters()):,}")
     print()
 
 while iter_num <= max_iters:
@@ -343,7 +356,7 @@ while iter_num <= max_iters:
     if grad_clip != 0.0:
         if scaler is not None:
             scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
 
     # optimizer step
     if scaler is not None:
@@ -353,9 +366,7 @@ while iter_num <= max_iters:
         optimizer.step()
 
     dt = time.time() - t0
-    tokens_per_sec = (
-        batch_size * block_size * gradient_accumulation_steps * ddp_world_size / dt
-    )
+    tokens_per_sec = tokens_per_iter / dt
 
     if iter_num % log_interval == 0 and master_process:
         loss_item = loss.item() * gradient_accumulation_steps
