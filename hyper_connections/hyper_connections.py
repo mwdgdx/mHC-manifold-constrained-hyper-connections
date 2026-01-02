@@ -210,8 +210,6 @@ class HyperConnections(Module):
 
         self.branch = branch
 
-        # activation, seemingly results were wishy washy depending on using tanh or not
-
         self.act = nn.Tanh() if tanh else nn.Identity()
 
         # frac-connections paper - num_fracs > 1 will be the `m` in their paper https://arxiv.org/abs/2503.14125

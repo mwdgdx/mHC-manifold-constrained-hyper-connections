@@ -1,23 +1,10 @@
 """
-Training script for nanoGPT with HyperConnections.
-
-Supports:
-- Single GPU or multi-GPU via torchrun
-- bf16/fp16 AMP
-- Shakespeare char-level (legacy) or FineWeb token-level data
+Train nanoGPT with HyperConnections.
 
 Usage:
-    # Single GPU, Shakespeare
     python train.py config/train_shakespeare_char.py
-
-    # Single GPU, FineWeb
     python train.py config/train_fineweb10B.py
-
-    # Multi-GPU (4x), FineWeb
     torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
-
-    # If NCCL fails (no InfiniBand), try:
-    NCCL_IB_DISABLE=1 torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
 """
 
 import glob
@@ -78,6 +65,10 @@ hc_disable = True
 mhc = False
 sinkhorn_iters = 10
 sinkhorn_tau = 0.05
+
+# value residual config
+v_residual = False
+v_residual_lamb_lr = 1e-2
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
@@ -252,6 +243,8 @@ model_config = GPTConfig(
     mhc=mhc,
     sinkhorn_iters=sinkhorn_iters,
     sinkhorn_tau=sinkhorn_tau,
+    v_residual=v_residual,
+    v_residual_lamb_lr=v_residual_lamb_lr,
 )
 
 model = GPT(model_config)
@@ -422,6 +415,8 @@ if wandb_log and master_process:
             "mhc": mhc,
             "sinkhorn_iters": sinkhorn_iters,
             "sinkhorn_tau": sinkhorn_tau,
+            "v_residual": v_residual,
+            "v_residual_lamb_lr": v_residual_lamb_lr,
             "dtype": dtype,
             "world_size": ddp_world_size,
             "tokens_per_iter": tokens_per_iter,
@@ -435,7 +430,8 @@ start_time = time.time()
 while iter_num <= max_iters:
     lr = get_lr(iter_num)
     for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        lr_scale = param_group.get("lr_scale", 1.0)
+        param_group["lr"] = lr * lr_scale
 
     # evaluation
     if iter_num % eval_interval == 0 and master_process:

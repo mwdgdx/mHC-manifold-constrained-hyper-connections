@@ -208,6 +208,7 @@ __marimo__/
 
 # mHC project local reference/docs (not tracked)
 reference-hc/
+reference-valueres/
 docs/
 AGENTS.md
 .DS_Store

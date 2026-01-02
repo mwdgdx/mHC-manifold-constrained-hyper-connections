@@ -1,13 +1,10 @@
 """
-Download FineWeb10B GPT-2 pretokenized shards from HuggingFace.
+Download FineWeb10B GPT-2 shards from HuggingFace.
 
 Usage:
-    python download.py          # downloads 9 train shards + 1 val shard (default)
-    python download.py 103      # downloads all 103 train shards + 1 val shard
-    python download.py 3        # downloads 3 train shards + 1 val shard
-
-Shards are downloaded to the same directory as this script.
-Each shard is ~200MB (~100M tokens).
+    python download.py
+    python download.py 103
+    python download.py 3
 
 Dataset: https://huggingface.co/datasets/kjj0/fineweb10B-gpt2
 """

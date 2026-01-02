@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
+from value_residual import ValueResidualState
 
 
 class LayerNorm(nn.Module):
@@ -32,6 +33,14 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
+        self.v_residual = config.v_residual
+        if self.v_residual:
+            self.lamb1 = nn.Parameter(torch.tensor(0.5))
+            self.lamb2 = nn.Parameter(torch.tensor(0.5))
+        else:
+            self.lamb1 = 1.0
+            self.lamb2 = 0.0
+
         self.flash = hasattr(F, "scaled_dot_product_attention")
         if not self.flash:
             bias = torch.tril(torch.ones(config.block_size, config.block_size))
@@ -39,15 +48,24 @@ class CausalSelfAttention(nn.Module):
                 "bias", bias.view(1, 1, config.block_size, config.block_size)
             )
 
-    def forward(self, x):
+    def forward(self, x, vrl_state=None):
         b, t, c = x.size()
 
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
 
-        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        q = q.view(b, t, self.n_head, self.head_dim)
+        k = k.view(b, t, self.n_head, self.head_dim)
+        v = v.view(b, t, self.n_head, self.head_dim)
+
+        if self.v_residual:
+            if vrl_state is None:
+                raise ValueError("v_residual requires vrl_state")
+            v = vrl_state.mix(v, self.lamb1, self.lamb2)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         if self.flash:
             y = F.scaled_dot_product_attention(
@@ -86,6 +104,17 @@ class MLP(nn.Module):
         return x
 
 
+class AttnBranch(nn.Module):
+    def __init__(self, norm, attn):
+        super().__init__()
+        self.norm = norm
+        self.attn = attn
+
+    def forward(self, x, vrl_state=None):
+        x = self.norm(x)
+        return self.attn(x, vrl_state=vrl_state)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx, init_hc):
         super().__init__()
@@ -93,6 +122,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.attn_branch = AttnBranch(self.ln_1, self.attn)
 
         hc_kwargs = dict(
             mhc=config.mhc,
@@ -102,7 +132,7 @@ class Block(nn.Module):
 
         self.hc_attn = init_hc(
             dim=config.n_embd,
-            branch=nn.Sequential(self.ln_1, self.attn),
+            branch=self.attn_branch,
             layer_index=layer_idx * 2,
             **hc_kwargs,
         )
@@ -114,8 +144,8 @@ class Block(nn.Module):
             **hc_kwargs,
         )
 
-    def forward(self, x):
-        x = self.hc_attn(x)
+    def forward(self, x, vrl_state=None):
+        x = self.hc_attn(x, vrl_state=vrl_state)
         x = self.hc_mlp(x)
         return x
 
@@ -136,6 +166,8 @@ class GPTConfig:
         self.mhc = kwargs.pop("mhc", False)
         self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 10)
         self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 0.05)
+        self.v_residual = kwargs.pop("v_residual", False)
+        self.v_residual_lamb_lr = kwargs.pop("v_residual_lamb_lr", 1e-2)
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -148,6 +180,7 @@ class GPT(nn.Module):
         assert config.block_size is not None
 
         self.config = config
+        self.vrl_state = ValueResidualState() if config.v_residual else None
 
         init_hc, expand_stream, reduce_stream = (
             get_init_and_expand_reduce_stream_functions(
@@ -203,8 +236,12 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         x = self.expand_stream(x)
 
+        vrl_state = self.vrl_state
+        if vrl_state is not None:
+            vrl_state.reset()
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, vrl_state=vrl_state)
 
         x = self.transformer.ln_f(x)
         x = self.reduce_stream(x)
@@ -237,9 +274,13 @@ class GPT(nn.Module):
 
         decay = {pn for pn in decay if pn in param_dict}
         no_decay = {pn for pn in no_decay if pn in param_dict}
+        lamb_params = {pn for pn in param_dict if "lamb" in pn}
+
+        decay -= lamb_params
+        no_decay -= lamb_params
 
         assert len(decay & no_decay) == 0
-        assert len(param_dict.keys() - (decay | no_decay)) == 0
+        assert len(param_dict.keys() - (decay | no_decay | lamb_params)) == 0
 
         optim_groups = [
             {
@@ -251,6 +292,17 @@ class GPT(nn.Module):
                 "weight_decay": 0.0,
             },
         ]
+
+        if lamb_params:
+            lamb_lr = self.config.v_residual_lamb_lr
+            optim_groups.append(
+                {
+                    "params": [param_dict[pn] for pn in sorted(lamb_params)],
+                    "weight_decay": 0.0,
+                    "lr": lamb_lr,
+                    "lr_scale": lamb_lr / learning_rate,
+                }
+            )
 
         use_fused = (
             device_type == "cuda"
