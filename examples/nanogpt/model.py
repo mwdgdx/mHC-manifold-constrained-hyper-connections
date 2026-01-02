@@ -94,16 +94,24 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
+        hc_kwargs = dict(
+            mhc=config.mhc,
+            sinkhorn_iters=config.sinkhorn_iters,
+            sinkhorn_tau=config.sinkhorn_tau,
+        )
+
         self.hc_attn = init_hc(
             dim=config.n_embd,
             branch=nn.Sequential(self.ln_1, self.attn),
             layer_index=layer_idx * 2,
+            **hc_kwargs,
         )
 
         self.hc_mlp = init_hc(
             dim=config.n_embd,
             branch=nn.Sequential(self.ln_2, self.mlp),
             layer_index=layer_idx * 2 + 1,
+            **hc_kwargs,
         )
 
     def forward(self, x):
@@ -125,6 +133,9 @@ class GPTConfig:
         self.hc_num_streams = kwargs.pop("hc_num_streams", 1)
         self.hc_num_fracs = kwargs.pop("hc_num_fracs", 1)
         self.hc_disable = kwargs.pop("hc_disable", False)
+        self.mhc = kwargs.pop("mhc", False)
+        self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 10)
+        self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 0.05)
 
         for key, value in kwargs.items():
             setattr(self, key, value)

@@ -75,6 +75,9 @@ dataset = "shakespeare_char"
 hc_num_streams = 1
 hc_num_fracs = 1
 hc_disable = True
+mhc = False
+sinkhorn_iters = 10
+sinkhorn_tau = 0.05
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
@@ -246,6 +249,9 @@ model_config = GPTConfig(
     hc_num_streams=hc_num_streams,
     hc_num_fracs=hc_num_fracs,
     hc_disable=hc_disable,
+    mhc=mhc,
+    sinkhorn_iters=sinkhorn_iters,
+    sinkhorn_tau=sinkhorn_tau,
 )
 
 model = GPT(model_config)
@@ -411,7 +417,11 @@ if wandb_log and master_process:
             "learning_rate": learning_rate,
             "max_iters": max_iters,
             "hc_num_streams": hc_num_streams,
+            "hc_num_fracs": hc_num_fracs,
             "hc_disable": hc_disable,
+            "mhc": mhc,
+            "sinkhorn_iters": sinkhorn_iters,
+            "sinkhorn_tau": sinkhorn_tau,
             "dtype": dtype,
             "world_size": ddp_world_size,
             "tokens_per_iter": tokens_per_iter,

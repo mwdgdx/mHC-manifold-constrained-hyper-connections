@@ -308,3 +308,76 @@ def test_backward_smoke():
     loss.backward()
 
     assert residual.grad is not None
+
+
+def test_mhc_H_res_constraints():
+    from hyper_connections.hyper_connections import HyperConnections, sinkhorn_log
+
+    hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
+    H_res = sinkhorn_log(hc.H_res_logits, hc.sinkhorn_iters, hc.sinkhorn_tau)
+
+    assert H_res.min().item() >= 0
+    assert torch.allclose(
+        H_res.sum(dim=-1),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=1e-3,
+    )
+    assert torch.allclose(
+        H_res.sum(dim=-2),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=1e-3,
+    )
+
+
+def test_mhc_H_pre_H_post_constraints():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
+    H_pre = torch.softmax(hc.H_pre_logits, dim=-1)
+    H_post = torch.softmax(hc.H_post_logits, dim=-1)
+
+    assert H_pre.min().item() >= 0
+    assert H_post.min().item() >= 0
+    assert torch.allclose(
+        H_pre.sum(),
+        torch.ones((), device=H_pre.device, dtype=H_pre.dtype),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        H_post.sum(),
+        torch.ones((), device=H_post.device, dtype=H_post.dtype),
+        atol=1e-6,
+    )
+
+
+def test_mhc_forward_shapes():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    streams, dim, batch, seq = 4, 64, 2, 8
+    hc = HyperConnections(num_residual_streams=streams, dim=dim, mhc=True)
+    x = torch.randn(batch * streams, seq, dim)
+
+    branch_input, add_residual = hc(x)
+    assert branch_input.shape == (batch, seq, dim)
+
+    branch_output = torch.randn(batch, seq, dim)
+    out = add_residual(branch_output)
+    assert out.shape == (batch * streams, seq, dim)
+
+
+def test_mhc_gradients_flow():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
+    x = torch.randn(8, 8, 64, requires_grad=True)
+
+    branch_input, add_residual = hc(x)
+    out = add_residual(branch_input)
+    out.sum().backward()
+
+    assert hc.H_res_logits.grad is not None
+    assert hc.H_pre_logits.grad is not None
+    assert hc.H_post_logits.grad is not None
+    assert not torch.isnan(hc.H_res_logits.grad).any()
+    assert not torch.isnan(hc.H_pre_logits.grad).any()
+    assert not torch.isnan(hc.H_post_logits.grad).any()
