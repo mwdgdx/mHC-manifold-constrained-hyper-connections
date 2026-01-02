@@ -6,6 +6,7 @@
 #   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_hc.py
 
 out_dir = "out-fineweb10B-hc"
+wandb_run_name = "hc"
 
 dataset = "fineweb10B"
 

@@ -21,6 +21,20 @@ Static per-layer matrices (closest to the paper):
 
 This is a research prototype aimed at correctness + clarity, not the paper's systems optimizations.
 
+### Running (nanogpt)
+
+Baseline (fineweb10B):
+
+```bash
+torchrun --standalone --nproc_per_node=4 --log-dir /tmp/torchrun --redirects 3 --tee 3 examples/nanogpt/train.py examples/nanogpt/config/train_fineweb10B.py
+```
+
+Hyper-Connections (fineweb10B):
+
+```bash
+torchrun --standalone --nproc_per_node=4 --log-dir /tmp/torchrun --redirects 3 --tee 3 examples/nanogpt/train.py examples/nanogpt/config/train_fineweb10B_hc.py
+```
+
 ### Acknowledgements
 
 Building on top of `lucidrains/hyper-connections`
