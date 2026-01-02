@@ -202,6 +202,8 @@ class HyperConnections(Module):
         mhc=False,
         sinkhorn_iters=10,
         sinkhorn_tau=0.05,
+        mhc_residual_identity_mix=False,
+        mhc_residual_alpha=0.9,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -298,6 +300,7 @@ class HyperConnections(Module):
         self.mhc = mhc
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
+        self.mhc_residual_identity_mix = mhc_residual_identity_mix
 
         if mhc:
             assert num_fracs == 1, "mhc currently requires num_fracs = 1"
@@ -313,6 +316,11 @@ class HyperConnections(Module):
 
             if add_branch_out_to_residual:
                 self.H_post_logits = nn.Parameter(torch.zeros(num_residual_streams))
+
+            if mhc_residual_identity_mix:
+                alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
+                alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
+                self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
 
     def width_connection(self, residuals):
         streams = self.num_residual_streams
@@ -347,9 +355,15 @@ class HyperConnections(Module):
                 residuals_mixed_source, "(b s) ... d -> b ... s d", s=streams
             )
 
-            H_res = sinkhorn_log(
-                self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau
-            )
+            S = sinkhorn_log(self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+
+            if self.mhc_residual_identity_mix:
+                alpha = torch.sigmoid(self.H_res_alpha_logit)
+                I = torch.eye(streams, device=S.device, dtype=S.dtype)
+                H_res = (1 - alpha) * I + alpha * S
+            else:
+                H_res = S
+
             H_pre = F.softmax(self.H_pre_logits, dim=-1)
 
             H_post = None
@@ -371,6 +385,8 @@ class HyperConnections(Module):
                     )
                     if H_post is not None:
                         stats["h_post_min"] = H_post.min()
+                    if self.mhc_residual_identity_mix:
+                        stats["h_res_alpha"] = torch.sigmoid(self.H_res_alpha_logit)
                     self.last_stats = {k: v.detach() for k, v in stats.items()}
 
             if self.channel_first:
