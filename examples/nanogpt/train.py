@@ -65,6 +65,10 @@ hc_disable = True
 mhc = False
 sinkhorn_iters = 10
 sinkhorn_tau = 0.05
+mhc_h_res_proj = "sinkhorn"
+ns_steps = 5
+ns_eps = 1e-7
+ns_coeffs = (3.0, -3.2, 1.2)
 
 # value residual config
 v_residual = False
@@ -243,6 +247,10 @@ model_config = GPTConfig(
     mhc=mhc,
     sinkhorn_iters=sinkhorn_iters,
     sinkhorn_tau=sinkhorn_tau,
+    mhc_h_res_proj=mhc_h_res_proj,
+    ns_steps=ns_steps,
+    ns_eps=ns_eps,
+    ns_coeffs=ns_coeffs,
     v_residual=v_residual,
     v_residual_lamb_lr=v_residual_lamb_lr,
 )
@@ -415,6 +423,10 @@ if wandb_log and master_process:
             "mhc": mhc,
             "sinkhorn_iters": sinkhorn_iters,
             "sinkhorn_tau": sinkhorn_tau,
+            "mhc_h_res_proj": mhc_h_res_proj,
+            "ns_steps": ns_steps,
+            "ns_eps": ns_eps,
+            "ns_coeffs": ns_coeffs,
             "v_residual": v_residual,
             "v_residual_lamb_lr": v_residual_lamb_lr,
             "dtype": dtype,

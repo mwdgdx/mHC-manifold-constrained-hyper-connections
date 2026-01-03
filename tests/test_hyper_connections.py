@@ -235,6 +235,40 @@ def test_mhc_H_res_constraints():
     )
 
 
+def test_mhc_orthostochastic_constraints():
+    from hyper_connections.hyper_connections import (
+        HyperConnections,
+        orthostochastic_project,
+        zeropower_via_newtonschulz,
+    )
+
+    hc = HyperConnections(
+        num_residual_streams=4,
+        dim=64,
+        mhc=True,
+        mhc_h_res_proj="orthostochastic",
+    )
+    O = zeropower_via_newtonschulz(
+        hc.H_res_logits,
+        steps=hc.ns_steps,
+        eps=hc.ns_eps,
+        coeffs=hc.ns_coeffs,
+    )
+    H_res = orthostochastic_project(
+        hc.H_res_logits,
+        ns_steps=hc.ns_steps,
+        ns_eps=hc.ns_eps,
+        ns_coeffs=hc.ns_coeffs,
+    )
+
+    assert H_res.min().item() >= 0
+    assert torch.allclose(
+        O @ O.T,
+        torch.eye(4, device=O.device, dtype=O.dtype),
+        atol=1e-2,
+    )
+
+
 def test_mhc_H_pre_H_post_constraints():
     from hyper_connections.hyper_connections import HyperConnections
 
