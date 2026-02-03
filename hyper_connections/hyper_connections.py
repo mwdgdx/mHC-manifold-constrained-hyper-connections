@@ -64,6 +64,34 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
     return torch.exp(Z + u.unsqueeze(1) + v.unsqueeze(0)) * n
 
 
+def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
+    a, b, c = coeffs
+
+    X = X / (X.norm() + eps)
+
+    transpose = False
+    if X.shape[0] > X.shape[1]:
+        X = X.T
+        transpose = True
+
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if transpose:
+        X = X.T
+
+    return X
+
+
+def orthostochastic_project(
+    logits, ns_steps=5, ns_eps=1e-7, ns_coeffs=(3.0, -3.2, 1.2)
+):
+    O = zeropower_via_newtonschulz(logits, steps=ns_steps, eps=ns_eps, coeffs=ns_coeffs)
+    return O.square()
+
+
 # main functions
 
 
@@ -202,6 +230,10 @@ class HyperConnections(Module):
         mhc=False,
         sinkhorn_iters=10,
         sinkhorn_tau=0.05,
+        mhc_h_res_proj="sinkhorn",
+        ns_steps=5,
+        ns_eps=1e-7,
+        ns_coeffs=(3.0, -3.2, 1.2),
         mhc_residual_identity_mix=False,
         mhc_residual_alpha=0.01,
     ):
@@ -300,11 +332,20 @@ class HyperConnections(Module):
         self.mhc = mhc
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
+        self.mhc_h_res_proj = mhc_h_res_proj
+        self.ns_steps = ns_steps
+        self.ns_eps = ns_eps
+        self.ns_coeffs = ns_coeffs
         self.mhc_residual_identity_mix = mhc_residual_identity_mix
+        self.mhc_residual_alpha = mhc_residual_alpha
 
         if mhc:
             assert num_fracs == 1, "mhc currently requires num_fracs = 1"
             assert num_input_views == 1, "mhc currently requires num_input_views = 1"
+            assert mhc_h_res_proj in (
+                "sinkhorn",
+                "orthostochastic",
+            ), "mhc_h_res_proj must be 'sinkhorn' or 'orthostochastic'"
 
             H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
             H_res_init.fill_diagonal_(0.0)
@@ -317,15 +358,15 @@ class HyperConnections(Module):
             if add_branch_out_to_residual:
                 self.H_post_logits = nn.Parameter(torch.zeros(num_residual_streams))
 
-            if mhc_residual_identity_mix:
-                alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
-                alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
-                self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
-
     def width_connection(self, residuals):
         streams = self.num_residual_streams
 
         maybe_transformed_residuals = self.residual_transform(residuals)
+
+            if mhc_residual_identity_mix:
+                alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
+                alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
+                self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
 
         # width connection
 
@@ -355,15 +396,23 @@ class HyperConnections(Module):
                 residuals_mixed_source, "(b s) ... d -> b ... s d", s=streams
             )
 
-            S = sinkhorn_log(self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+            if self.mhc_h_res_proj == "orthostochastic":
+                H_res = orthostochastic_project(
+                    self.H_res_logits,
+                    ns_steps=self.ns_steps,
+                    ns_eps=self.ns_eps,
+                    ns_coeffs=self.ns_coeffs,
+                )
+            else:
+                H_res = sinkhorn_log(
+                    self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau
+                )
 
+            # Apply identity mix if enabled
             if self.mhc_residual_identity_mix:
                 alpha = torch.sigmoid(self.H_res_alpha_logit)
-                I = torch.eye(streams, device=S.device, dtype=S.dtype)
-                H_res = (1 - alpha) * I + alpha * S
-            else:
-                H_res = S
-
+                I = torch.eye(streams, device=H_res.device, dtype=H_res.dtype)
+                H_res = (1 - alpha) * I + alpha * H_res
             H_pre = F.softmax(self.H_pre_logits, dim=-1)
 
             H_post = None
