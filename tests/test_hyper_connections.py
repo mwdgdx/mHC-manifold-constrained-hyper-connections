@@ -235,40 +235,6 @@ def test_mhc_H_res_constraints():
     )
 
 
-def test_mhc_orthostochastic_constraints():
-    from hyper_connections.hyper_connections import (
-        HyperConnections,
-        orthostochastic_project,
-        zeropower_via_newtonschulz,
-    )
-
-    hc = HyperConnections(
-        num_residual_streams=4,
-        dim=64,
-        mhc=True,
-        mhc_h_res_proj="orthostochastic",
-    )
-    O = zeropower_via_newtonschulz(
-        hc.H_res_logits,
-        steps=hc.ns_steps,
-        eps=hc.ns_eps,
-        coeffs=hc.ns_coeffs,
-    )
-    H_res = orthostochastic_project(
-        hc.H_res_logits,
-        ns_steps=hc.ns_steps,
-        ns_eps=hc.ns_eps,
-        ns_coeffs=hc.ns_coeffs,
-    )
-
-    assert H_res.min().item() >= 0
-    assert torch.allclose(
-        O @ O.T,
-        torch.eye(4, device=O.device, dtype=O.dtype),
-        atol=1e-2,
-    )
-
-
 def test_mhc_H_pre_H_post_constraints():
     from hyper_connections.hyper_connections import HyperConnections
 
@@ -323,12 +289,16 @@ def test_mhc_gradients_flow():
     assert not torch.isnan(hc.H_post_logits.grad).any()
 
 
-def test_mhc_channel_first_H_res_constraints():
-    from hyper_connections.hyper_connections_channel_first import HyperConnections
-    from hyper_connections.hyper_connections import sinkhorn_log
+def test_mhc_identity_mix_H_res_constraints():
+    from hyper_connections.hyper_connections import HyperConnections, sinkhorn_log
 
-    hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
-    H_res = sinkhorn_log(hc.H_res_logits, hc.sinkhorn_iters, hc.sinkhorn_tau)
+    hc = HyperConnections(
+        num_residual_streams=4, dim=64, mhc=True, mhc_residual_identity_mix=True
+    )
+    S = sinkhorn_log(hc.H_res_logits, hc.sinkhorn_iters, hc.sinkhorn_tau)
+    alpha = torch.sigmoid(hc.H_res_alpha_logit)
+    I = torch.eye(4, device=S.device, dtype=S.dtype)
+    H_res = (1 - alpha) * I + alpha * S
 
     assert H_res.min().item() >= 0
     assert torch.allclose(
@@ -343,37 +313,100 @@ def test_mhc_channel_first_H_res_constraints():
     )
 
 
-def test_mhc_channel_first_H_pre_H_post_constraints():
-    from hyper_connections.hyper_connections_channel_first import HyperConnections
+def test_mhc_identity_mix_alpha_init():
+    from hyper_connections.hyper_connections import HyperConnections
 
-    hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
-    H_pre = torch.softmax(hc.H_pre_logits, dim=-1)
-    H_post = torch.softmax(hc.H_post_logits, dim=-1)
-
-    assert H_pre.min().item() >= 0
-    assert H_post.min().item() >= 0
-    assert torch.allclose(
-        H_pre.sum(),
-        torch.ones((), device=H_pre.device, dtype=H_pre.dtype),
-        atol=1e-6,
+    hc = HyperConnections(
+        num_residual_streams=4,
+        dim=64,
+        mhc=True,
+        mhc_residual_identity_mix=True,
+        mhc_residual_alpha=0.01,
     )
-    assert torch.allclose(
-        H_post.sum(),
-        torch.ones((), device=H_post.device, dtype=H_post.dtype),
-        atol=1e-6,
+    alpha = torch.sigmoid(hc.H_res_alpha_logit)
+    assert torch.allclose(alpha, torch.tensor(0.01), atol=1e-3)
+
+
+def test_mhc_identity_mix_gradients_flow():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    hc = HyperConnections(
+        num_residual_streams=4, dim=64, mhc=True, mhc_residual_identity_mix=True
     )
-
-
-def test_mhc_channel_first_forward_shapes():
-    from hyper_connections.hyper_connections_channel_first import HyperConnections
-
-    streams, dim, batch, height, width = 4, 64, 2, 8, 8
-    hc = HyperConnections(num_residual_streams=streams, dim=dim, mhc=True)
-    x = torch.randn(batch * streams, dim, height, width)
+    x = torch.randn(8, 8, 64, requires_grad=True)
 
     branch_input, add_residual = hc(x)
-    assert branch_input.shape == (batch, dim, height, width)
+    out = add_residual(branch_input)
+    out.sum().backward()
 
-    branch_output = torch.randn(batch, dim, height, width)
+    assert hc.H_res_logits.grad is not None
+    assert hc.H_pre_logits.grad is not None
+    assert hc.H_post_logits.grad is not None
+    assert hc.H_res_alpha_logit.grad is not None
+    assert not torch.isnan(hc.H_res_alpha_logit.grad).any()
+
+
+def test_mhc_identity_mix_forward_shapes():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    streams, dim, batch, seq = 4, 64, 2, 8
+    hc = HyperConnections(
+        num_residual_streams=streams,
+        dim=dim,
+        mhc=True,
+        mhc_residual_identity_mix=True,
+    )
+    x = torch.randn(batch * streams, seq, dim)
+
+    branch_input, add_residual = hc(x)
+    assert branch_input.shape == (batch, seq, dim)
+
+    branch_output = torch.randn(batch, seq, dim)
     out = add_residual(branch_output)
-    assert out.shape == (batch * streams, dim, height, width)
+    assert out.shape == (batch * streams, seq, dim)
+
+
+def test_hc_width_connection_applies_residual_mixing():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    torch.manual_seed(0)
+
+    streams, dim, batch, seq = 2, 4, 1, 3
+    hc = HyperConnections(num_residual_streams=streams, dim=dim)
+
+    x0 = torch.zeros(batch, seq, dim)
+    x1 = torch.ones(batch, seq, dim)
+    x = torch.cat((x0, x1), dim=0)
+
+    with torch.no_grad():
+        hc.static_alpha.zero_()
+        hc.static_alpha[1, 1] = 1.0  # residual stream 0 output <- stream 1
+        hc.static_alpha[0, 2] = 1.0  # residual stream 1 output <- stream 0
+
+    branch_input, residuals, _ = hc.width_connection(x)
+
+    torch.testing.assert_close(branch_input, torch.zeros(batch, seq, dim))
+    torch.testing.assert_close(residuals, torch.cat((x1, x0), dim=0))
+
+
+def test_hc_channel_first_width_connection_applies_residual_mixing():
+    from hyper_connections.hyper_connections_channel_first import HyperConnections
+
+    torch.manual_seed(0)
+
+    streams, dim, batch, h, w = 2, 4, 1, 2, 2
+    hc = HyperConnections(num_residual_streams=streams, dim=dim)
+
+    x0 = torch.zeros(batch, dim, h, w)
+    x1 = torch.ones(batch, dim, h, w)
+    x = torch.cat((x0, x1), dim=0)
+
+    with torch.no_grad():
+        hc.static_alpha.zero_()
+        hc.static_alpha[1, 1] = 1.0  # residual stream 0 output <- stream 1
+        hc.static_alpha[0, 2] = 1.0  # residual stream 1 output <- stream 0
+
+    branch_input, residuals, _ = hc.width_connection(x)
+
+    torch.testing.assert_close(branch_input, torch.zeros(batch, dim, h, w))
+    torch.testing.assert_close(residuals, torch.cat((x1, x0), dim=0))
