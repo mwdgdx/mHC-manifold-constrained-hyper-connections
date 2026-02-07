@@ -11,8 +11,15 @@ import glob
 import json
 import math
 import os
+import platform
+import shlex
+import socket
+import subprocess
+import sys
 import time
+import traceback
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -145,6 +152,10 @@ if v_residual:
 
 ddp = int(os.environ.get("RANK", -1)) != -1
 
+# Keep the user-provided value for reproducibility. In DDP we divide
+# `gradient_accumulation_steps` by world size (below).
+gradient_accumulation_steps_total = gradient_accumulation_steps
+
 if ddp:
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -171,6 +182,216 @@ device_type = (
     if isinstance(device, torch.device)
     else ("cuda" if "cuda" in device else "cpu")
 )
+
+# -----------------------------------------------------------------------------
+# Minimal run artifact contract
+
+RUN_CONTRACT_VERSION = 1
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (Path, torch.device, torch.dtype)):
+        return str(value)
+    return str(value)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _try_git_info(repo_dir: Path) -> dict[str, str] | None:
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+        ).strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_dir), "diff", "--quiet"],
+            text=True,
+            check=False,
+        ).returncode
+        return {"commit": commit, "branch": branch, "dirty": "true" if dirty != 0 else "false"}
+    except Exception:
+        return None
+
+
+def _write_run_contract_init(*, out_dir_path: Path, repo_dir: Path, run_id: str) -> None:
+    # command.sh should be reproducible and must not contain secrets.
+    if ddp:
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={ddp_world_size}",
+            "train.py",
+            *sys.argv[1:],
+        ]
+    else:
+        cmd = [sys.executable, "train.py", *sys.argv[1:]]
+
+    command_sh = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"cd {shlex.quote(str(Path(__file__).resolve().parent))}",
+            shlex.join(cmd),
+            "",
+        ]
+    )
+    _atomic_write_text(out_dir_path / "command.sh", command_sh)
+    os.chmod(out_dir_path / "command.sh", 0o755)
+
+    git_info = _try_git_info(repo_dir)
+    payload = {
+        "contract_version": RUN_CONTRACT_VERSION,
+        "run_id": run_id,
+        "run_kind": "nanogpt_train",
+        "out_dir": str(out_dir_path),
+        "argv": list(sys.argv),
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "ddp": ddp,
+        "rank": ddp_rank if ddp else 0,
+        "world_size": ddp_world_size,
+        "device": str(device),
+        "device_type": device_type,
+        "wandb": {
+            "enabled": bool(wandb_log),
+            "project": wandb_project,
+            "group": wandb_group,
+            "run_name": wandb_run_name,
+            "job_type": wandb_job_type,
+            "variant": wandb_variant,
+        },
+        "git": git_info,
+        "ts": int(time.time()),
+    }
+    _atomic_write_json(out_dir_path / "run_metadata.json", payload)
+
+
+def _write_config_effective(*, out_dir_path: Path) -> None:
+    keys = [
+        # output + run
+        "out_dir",
+        "dataset",
+        "seed",
+        "dtype",
+        "compile_model",
+        # model
+        "n_layer",
+        "n_head",
+        "n_embd",
+        "dropout",
+        "bias",
+        # optimization
+        "learning_rate",
+        "weight_decay",
+        "beta1",
+        "beta2",
+        "grad_clip",
+        "warmup_iters",
+        "lr_decay_iters",
+        "min_lr",
+        "max_iters",
+        "batch_size",
+        "block_size",
+        # hyper-connections
+        "hc_num_streams",
+        "hc_num_fracs",
+        "hc_disable",
+        "mhc",
+        "sinkhorn_iters",
+        "sinkhorn_tau",
+        "mhc_h_res_proj",
+        "ns_steps",
+        "ns_eps",
+        "ns_coeffs",
+        # v-residual
+        "v_residual",
+        "v_residual_lamb_lr",
+        # logging
+        "wandb_log",
+        "wandb_project",
+        "wandb_run_name",
+        "wandb_group",
+        "wandb_job_type",
+        "wandb_tags",
+        "wandb_log_layer_stats",
+        "wandb_log_layer_cosine",
+        # DDP
+        "backend",
+    ]
+    effective = {k: _json_safe(globals().get(k)) for k in keys}
+    effective.update(
+        {
+            "contract_version": RUN_CONTRACT_VERSION,
+            "wandb_variant": wandb_variant,
+            "ddp": ddp,
+            "world_size": ddp_world_size,
+            "gradient_accumulation_steps_total": gradient_accumulation_steps_total,
+            "gradient_accumulation_steps_per_rank": gradient_accumulation_steps,
+        }
+    )
+    _atomic_write_json(out_dir_path / "config_effective.json", effective)
+
+
+def _write_dataset_manifest(*, out_dir_path: Path, dataset_name: str, data_dir_path: Path, train_files, val_files) -> None:
+    def file_info(path: str) -> dict[str, object]:
+        p = Path(path)
+        stat = p.stat()
+        return {
+            "path": str(p),
+            "size_bytes": int(stat.st_size),
+            "mtime": float(stat.st_mtime),
+        }
+
+    payload = {
+        "contract_version": RUN_CONTRACT_VERSION,
+        "dataset": dataset_name,
+        "data_dir": str(data_dir_path),
+        "train": [file_info(p) for p in train_files],
+        "val": [file_info(p) for p in val_files],
+    }
+    _atomic_write_json(out_dir_path / "dataset_manifest.json", payload)
+
+
+out_dir_path = Path(out_dir)
+run_id = out_dir_path.resolve().name
+repo_dir = Path(__file__).resolve().parents[2]
+
+if master_process:
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    _write_run_contract_init(out_dir_path=out_dir_path, repo_dir=repo_dir, run_id=run_id)
+    _write_config_effective(out_dir_path=out_dir_path)
+
+if ddp:
+    dist.barrier()
 
 # -----------------------------------------------------------------------------
 # AMP setup
@@ -229,6 +450,13 @@ if dataset == "fineweb10B":
 
     if master_process:
         print(f"Found {len(train_shards)} train shards, {len(val_shards)} val shards")
+        _write_dataset_manifest(
+            out_dir_path=out_dir_path,
+            dataset_name=dataset,
+            data_dir_path=Path(data_dir),
+            train_files=train_shards,
+            val_files=val_shards,
+        )
 
     # load all shards into memory (for simplicity; ~200MB per shard)
     # for large-scale, would stream shards instead
@@ -253,6 +481,15 @@ else:
         meta = json.load(f)
 
     vocab_size = meta["vocab_size"]
+
+    if master_process:
+        _write_dataset_manifest(
+            out_dir_path=out_dir_path,
+            dataset_name=dataset,
+            data_dir_path=Path(data_dir),
+            train_files=[train_path],
+            val_files=[val_path],
+        )
 
 # -----------------------------------------------------------------------------
 # Batch sampling (simple random contiguous windows)
@@ -435,6 +672,8 @@ def estimate_loss():
 
 iter_num = 0
 best_val_loss = 1e9
+last_eval_losses = None
+last_eval_iter = None
 
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 if master_process:
@@ -448,9 +687,19 @@ if master_process:
     print()
 
 if wandb_log and master_process:
-    import wandb
+    import wandb as wandb_lib
 
-    wandb.init(
+    wandb = wandb_lib
+else:
+    wandb = None
+
+start_time = time.time()
+run_success = False
+run_error = None
+
+try:
+    if wandb is not None:
+        wandb.init(
         project=wandb_project,
         name=wandb_run_name,
         group=wandb_group,
@@ -483,126 +732,168 @@ if wandb_log and master_process:
             "wandb_log_layer_stats": wandb_log_layer_stats,
             "wandb_log_layer_cosine": wandb_log_layer_cosine,
         },
-    )
-
-start_time = time.time()
-
-while iter_num <= max_iters:
-    lr = get_lr(iter_num)
-    for param_group in optimizer.param_groups:
-        lr_scale = param_group.get("lr_scale", 1.0)
-        param_group["lr"] = lr * lr_scale
-
-    # evaluation
-    if iter_num % eval_interval == 0 and master_process:
-        losses, layer_cosine = estimate_loss()
-        print(
-            f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
         )
-        if wandb_log:
-            eval_log = {
-                "val/loss": losses["val"],
-                "train/loss_eval": losses["train"],
-                "perf/elapsed_s": time.time() - start_time,
-                "tokens/seen": iter_num * tokens_per_iter,
-            }
-            wandb.log(eval_log, step=iter_num)
-            if wandb_log_layer_cosine and layer_cosine is not None:
-                layer_table = wandb.Table(columns=["layer", "cosine"])
-                for idx, value in enumerate(layer_cosine):
-                    layer_table.add_data(idx, value)
-                wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
-            if wandb_log_layer_stats:
-                layer_stats = collect_hc_layer_stats()
-                layer_stats_table = build_layer_table(layer_stats)
-                if layer_stats_table is not None:
-                    wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
-        if losses["val"] < best_val_loss:
-            best_val_loss = losses["val"]
-            os.makedirs(out_dir, exist_ok=True)
-            checkpoint = {
-                "model": raw_model.state_dict(),
-                "config": model_config.__dict__,
-                "iter_num": iter_num,
-                "best_val_loss": best_val_loss,
-            }
-            torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
 
-    t0 = time.time()
+    while iter_num <= max_iters:
+        lr = get_lr(iter_num)
+        for param_group in optimizer.param_groups:
+            lr_scale = param_group.get("lr_scale", 1.0)
+            param_group["lr"] = lr * lr_scale
 
-    # training step with gradient accumulation
-    optimizer.zero_grad(set_to_none=True)
+        # evaluation
+        if iter_num % eval_interval == 0 and master_process:
+            losses, layer_cosine = estimate_loss()
+            last_eval_losses = losses
+            last_eval_iter = iter_num
+            print(
+                f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+            )
+            if wandb is not None:
+                eval_log = {
+                    "val/loss": losses["val"],
+                    "train/loss_eval": losses["train"],
+                    "perf/elapsed_s": time.time() - start_time,
+                    "tokens/seen": iter_num * tokens_per_iter,
+                }
+                wandb.log(eval_log, step=iter_num)
+                if wandb_log_layer_cosine and layer_cosine is not None:
+                    layer_table = wandb.Table(columns=["layer", "cosine"])
+                    for idx, value in enumerate(layer_cosine):
+                        layer_table.add_data(idx, value)
+                    wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
+                if wandb_log_layer_stats:
+                    layer_stats = collect_hc_layer_stats()
+                    layer_stats_table = build_layer_table(layer_stats)
+                    if layer_stats_table is not None:
+                        wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
+            if losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+                os.makedirs(out_dir, exist_ok=True)
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "config": model_config.__dict__,
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val_loss,
+                }
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
 
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # only sync gradients on the last micro step
-            model.require_backward_grad_sync = (
-                micro_step == gradient_accumulation_steps - 1
+        t0 = time.time()
+
+        # training step with gradient accumulation
+        optimizer.zero_grad(set_to_none=True)
+
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # only sync gradients on the last micro step
+                model.require_backward_grad_sync = (
+                    micro_step == gradient_accumulation_steps - 1
+                )
+
+            x, y = get_batch("train")
+
+            with ctx:
+                _, loss = model(x, y)
+                loss = loss / gradient_accumulation_steps
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        # gradient clipping
+        grad_norm = None
+        if grad_clip != 0.0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                raw_model.parameters(), grad_clip
             )
 
-        x, y = get_batch("train")
-
-        with ctx:
-            _, loss = model(x, y)
-            loss = loss / gradient_accumulation_steps
-
+        # optimizer step
         if scaler is not None:
-            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            loss.backward()
+            optimizer.step()
 
-    # gradient clipping
-    grad_norm = None
-    if grad_clip != 0.0:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
+        dt = time.time() - t0
+        tokens_per_sec = tokens_per_iter / dt
 
-    # optimizer step
-    if scaler is not None:
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
+        if iter_num % log_interval == 0 and master_process:
+            loss_item = loss.item() * gradient_accumulation_steps
+            print(
+                f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
+                f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
+            )
+            if wandb is not None:
+                log_dict = {
+                    "train/loss": loss_item,
+                    "train/lr": lr,
+                    "perf/tok_per_sec": tokens_per_sec,
+                    "perf/iter_time_ms": dt * 1000,
+                    "perf/elapsed_s": time.time() - start_time,
+                    "tokens/seen": iter_num * tokens_per_iter,
+                }
+                if grad_norm is not None:
+                    log_dict["train/grad_norm"] = grad_norm.item()
+                if device_type == "cuda":
+                    log_dict["perf/max_mem_allocated_mb"] = (
+                        torch.cuda.max_memory_allocated() / 1e6
+                    )
+                    log_dict["perf/max_mem_reserved_mb"] = (
+                        torch.cuda.max_memory_reserved() / 1e6
+                    )
+                wandb.log(log_dict, step=iter_num)
+                if device_type == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
 
-    dt = time.time() - t0
-    tokens_per_sec = tokens_per_iter / dt
+        iter_num += 1
 
-    if iter_num % log_interval == 0 and master_process:
-        loss_item = loss.item() * gradient_accumulation_steps
-        print(
-            f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
-            f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
-        )
-        if wandb_log:
-            log_dict = {
-                "train/loss": loss_item,
-                "train/lr": lr,
-                "perf/tok_per_sec": tokens_per_sec,
-                "perf/iter_time_ms": dt * 1000,
-                "perf/elapsed_s": time.time() - start_time,
-                "tokens/seen": iter_num * tokens_per_iter,
-            }
-            if grad_norm is not None:
-                log_dict["train/grad_norm"] = grad_norm.item()
-            if device_type == "cuda":
-                log_dict["perf/max_mem_allocated_mb"] = (
-                    torch.cuda.max_memory_allocated() / 1e6
-                )
-                log_dict["perf/max_mem_reserved_mb"] = (
-                    torch.cuda.max_memory_reserved() / 1e6
-                )
-            wandb.log(log_dict, step=iter_num)
-            if device_type == "cuda":
-                torch.cuda.reset_peak_memory_stats()
+    run_success = True
+except Exception:
+    run_error = traceback.format_exc()
+    raise
+finally:
+    if master_process:
+        end_time = time.time()
+        summary = {
+            "contract_version": RUN_CONTRACT_VERSION,
+            "run_id": run_id,
+            "run_kind": "nanogpt_train",
+            "ok": bool(run_success),
+            "start_time": float(start_time),
+            "end_time": float(end_time),
+            "elapsed_s": float(end_time - start_time),
+            "iter_num": int(iter_num),
+            "max_iters": int(max_iters),
+            "tokens_per_iter": int(tokens_per_iter),
+            "tokens_seen": int((iter_num - 1) * tokens_per_iter) if iter_num > 0 else 0,
+            "best_val_loss": float(best_val_loss),
+            "last_eval_iter": int(last_eval_iter) if last_eval_iter is not None else None,
+            "last_eval": _json_safe(last_eval_losses) if last_eval_losses is not None else None,
+            "ddp": bool(ddp),
+            "world_size": int(ddp_world_size),
+            "device": str(device),
+            "dtype": str(dtype),
+            "wandb": {
+                "enabled": wandb is not None,
+                "project": wandb_project,
+                "group": wandb_group,
+                "run_name": wandb_run_name,
+                "job_type": wandb_job_type,
+                "variant": wandb_variant,
+                "tags": _json_safe(wandb_tags),
+            },
+        }
+        if run_error:
+            summary["error"] = run_error
+        _atomic_write_json(out_dir_path / "summary.json", summary)
 
-    iter_num += 1
+    if wandb is not None and master_process:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
-# -----------------------------------------------------------------------------
-# Cleanup
-
-if wandb_log and master_process:
-    wandb.finish()
-
-if ddp:
-    dist.destroy_process_group()
+    if ddp:
+        dist.destroy_process_group()
