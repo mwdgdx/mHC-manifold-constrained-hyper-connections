@@ -2,7 +2,6 @@
 Train nanoGPT with HyperConnections.
 
 Usage:
-    python train.py config/train_shakespeare_char.py
     python train.py config/train_fineweb10B.py
     torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
 """
@@ -63,8 +62,25 @@ gradient_accumulation_steps = 1
 
 seed = 1337
 
-# dataset: "shakespeare_char" or "fineweb10B"
-dataset = "shakespeare_char"
+# dataset: "fineweb10B"
+dataset = "fineweb10B"
+
+# Optional override (useful for tests and external mounts). If not set, defaults
+# to `examples/nanogpt/data/<dataset>`.
+data_dir = None
+
+NS_COEFFS = (
+    (7.2086, -15.5131, 9.0178),
+    (3.9623, -2.5813, 0.4542),
+    (3.9466, -2.5765, 0.4544),
+    (3.8991, -2.5671, 0.4566),
+    (3.7186, -2.5308, 0.4653),
+    (3.1390, -2.3073, 0.4733),
+    (2.1715, -1.5246, 0.3885),
+    (1.8648, -1.2224, 0.3577),
+)
+
+NS_STEPS = len(NS_COEFFS)
 
 # hyper-connections config
 hc_num_streams = 1
@@ -86,6 +102,9 @@ v_residual_lamb_lr = 1e-2
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
+
+# Optional override. If unset, will auto-select (cuda > mps > cpu).
+device = None
 
 # torch.compile (requires PyTorch 2.0+)
 compile_model = False
@@ -118,7 +137,8 @@ def get_wandb_variant():
 
 wandb_variant = get_wandb_variant()
 wandb_group = f"{dataset}-L{n_layer}-D{n_embd}-H{n_head}"
-wandb_run_name = f"{dataset}-{wandb_variant}-L{n_layer}-D{n_embd}-H{n_head}-s{seed}"
+if wandb_run_name == "baseline":
+    wandb_run_name = f"{dataset}-{wandb_variant}-L{n_layer}-D{n_embd}-H{n_head}-s{seed}"
 wandb_job_type = wandb_variant
 wandb_tags = [
     dataset,
@@ -173,12 +193,13 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -423,83 +444,64 @@ else:
 # -----------------------------------------------------------------------------
 # Data loading
 
-data_dir = os.path.join(os.path.dirname(__file__), "data", dataset)
+if data_dir is None:
+    data_dir = os.path.join(os.path.dirname(__file__), "data", dataset)
 
-if dataset == "fineweb10B":
-    # FineWeb10B: pretokenized GPT-2 shards
-    # Format: 256 x int32 header, then uint16 tokens
-    # Header: [0]=magic(20240520), [1]=version(1), [2]=num_tokens
+if dataset != "fineweb10B":
+    raise ValueError(f"unknown dataset: {dataset}")
 
-    FINEWEB_MAGIC = 20240520
-    FINEWEB_VERSION = 1
-    HEADER_SIZE = 256  # int32 count
+# FineWeb10B: pretokenized GPT-2 shards
+# Format: 256 x int32 header, then uint16 tokens
+# Header: [0]=magic(20240520), [1]=version(1), [2]=num_tokens
 
-    def load_fineweb_shard(path):
-        """Load a FineWeb shard, validate header, return tokens as int64 tensor."""
-        header = torch.from_file(
-            str(path), shared=False, size=HEADER_SIZE, dtype=torch.int32
-        )
-        assert header[0].item() == FINEWEB_MAGIC, f"bad magic in {path}"
-        assert header[1].item() == FINEWEB_VERSION, f"bad version in {path}"
-        num_tokens = int(header[2].item())
+FINEWEB_MAGIC = 20240520
+FINEWEB_VERSION = 1
+HEADER_SIZE = 256  # int32 count
 
-        # read tokens (uint16 -> convert to int64 for embedding lookup)
-        with open(path, "rb") as f:
-            f.seek(HEADER_SIZE * 4)  # skip header (256 * 4 bytes)
-            buf = np.frombuffer(f.read(num_tokens * 2), dtype=np.uint16)
-            tokens = torch.from_numpy(buf.astype(np.int64))
 
-        return tokens
+def load_fineweb_shard(path):
+    """Load a FineWeb shard, validate header, return tokens as int64 tensor."""
+    header = torch.from_file(
+        str(path), shared=False, size=HEADER_SIZE, dtype=torch.int32
+    )
+    assert header[0].item() == FINEWEB_MAGIC, f"bad magic in {path}"
+    assert header[1].item() == FINEWEB_VERSION, f"bad version in {path}"
+    num_tokens = int(header[2].item())
 
-    # find shards
-    train_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_train_*.bin")))
-    val_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_val_*.bin")))
+    # read tokens (uint16 -> convert to int64 for embedding lookup)
+    with open(path, "rb") as f:
+        f.seek(HEADER_SIZE * 4)  # skip header (256 * 4 bytes)
+        buf = np.frombuffer(f.read(num_tokens * 2), dtype=np.uint16)
+        tokens = torch.from_numpy(buf.astype(np.int64))
 
-    assert len(train_shards) > 0, f"no train shards found in {data_dir}"
-    assert len(val_shards) > 0, f"no val shards found in {data_dir}"
+    return tokens
 
-    if master_process:
-        print(f"Found {len(train_shards)} train shards, {len(val_shards)} val shards")
-        _write_dataset_manifest(
-            out_dir_path=out_dir_path,
-            dataset_name=dataset,
-            data_dir_path=Path(data_dir),
-            train_files=train_shards,
-            val_files=val_shards,
-        )
+# find shards
+train_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_train_*.bin")))
+val_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_val_*.bin")))
 
-    # load all shards into memory (for simplicity; ~200MB per shard)
-    # for large-scale, would stream shards instead
-    train_data = torch.cat([load_fineweb_shard(s) for s in train_shards])
-    val_data = torch.cat([load_fineweb_shard(s) for s in val_shards])
+assert len(train_shards) > 0, f"no train shards found in {data_dir}"
+assert len(val_shards) > 0, f"no val shards found in {data_dir}"
 
-    if master_process:
-        print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
+if master_process:
+    print(f"Found {len(train_shards)} train shards, {len(val_shards)} val shards")
+    _write_dataset_manifest(
+        out_dir_path=out_dir_path,
+        dataset_name=dataset,
+        data_dir_path=Path(data_dir),
+        train_files=train_shards,
+        val_files=val_shards,
+    )
 
-    vocab_size = 50304  # GPT-2 vocab size rounded up for efficiency
+# load all shards into memory (for simplicity; ~200MB per shard)
+# for large-scale, would stream shards instead
+train_data = torch.cat([load_fineweb_shard(s) for s in train_shards])
+val_data = torch.cat([load_fineweb_shard(s) for s in val_shards])
 
-else:
-    # Shakespeare char-level (legacy)
-    train_path = os.path.join(data_dir, "train.bin")
-    val_path = os.path.join(data_dir, "val.bin")
-    meta_path = os.path.join(data_dir, "meta.json")
+if master_process:
+    print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
 
-    train_data = torch.load(train_path, weights_only=True)
-    val_data = torch.load(val_path, weights_only=True)
-
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
-
-    vocab_size = meta["vocab_size"]
-
-    if master_process:
-        _write_dataset_manifest(
-            out_dir_path=out_dir_path,
-            dataset_name=dataset,
-            data_dir_path=Path(data_dir),
-            train_files=[train_path],
-            val_files=[val_path],
-        )
+vocab_size = 50304  # GPT-2 vocab size rounded up for efficiency
 
 # -----------------------------------------------------------------------------
 # Batch sampling (simple random contiguous windows)
