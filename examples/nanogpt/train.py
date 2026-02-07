@@ -7,6 +7,7 @@ Usage:
 """
 
 import glob
+import json
 import math
 import os
 import platform
@@ -18,6 +19,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -238,7 +240,7 @@ def _atomic_write_json(path: Path, payload) -> None:
     os.replace(tmp, path)
 
 
-def _try_git_info(repo_dir: Path) -> dict[str, str] | None:
+def _try_git_info(repo_dir: Path) -> Optional[dict[str, str]]:
     try:
         commit = subprocess.check_output(
             ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
