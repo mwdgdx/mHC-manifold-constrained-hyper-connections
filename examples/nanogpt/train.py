@@ -65,6 +65,10 @@ seed = 1337
 # dataset: "fineweb10B"
 dataset = "fineweb10B"
 
+# Optional override (useful for tests and external mounts). If not set, defaults
+# to `examples/nanogpt/data/<dataset>`.
+data_dir = None
+
 NS_COEFFS = (
     (7.2086, -15.5131, 9.0178),
     (3.9623, -2.5813, 0.4542),
@@ -98,6 +102,9 @@ v_residual_lamb_lr = 1e-2
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
+
+# Optional override. If unset, will auto-select (cuda > mps > cpu).
+device = None
 
 # torch.compile (requires PyTorch 2.0+)
 compile_model = False
@@ -186,12 +193,13 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -436,7 +444,8 @@ else:
 # -----------------------------------------------------------------------------
 # Data loading
 
-data_dir = os.path.join(os.path.dirname(__file__), "data", dataset)
+if data_dir is None:
+    data_dir = os.path.join(os.path.dirname(__file__), "data", dataset)
 
 if dataset != "fineweb10B":
     raise ValueError(f"unknown dataset: {dataset}")
