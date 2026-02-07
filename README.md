@@ -31,6 +31,8 @@ python train.py config/train_fineweb10B.py
 python train.py config/train_fineweb10B_hc.py
 python train.py config/train_fineweb10B_mhc.py
 python train.py config/train_fineweb10B_vres.py
+python train.py config/train_fineweb10B_vres_mhc.py
+python train.py config/train_fineweb10B_cvres_mhc.py
 ```
 
 **48-layer configs (~20M params):**
@@ -39,6 +41,8 @@ python train.py config/train_fineweb10B_48l.py
 python train.py config/train_fineweb10B_hc_48l.py
 python train.py config/train_fineweb10B_mhc_48l.py
 python train.py config/train_fineweb10B_vres_48l.py
+python train.py config/train_fineweb10B_vres_mhc_48l.py
+python train.py config/train_fineweb10B_cvres_mhc_48l.py
 ```
 
 **Multi-GPU example:**
@@ -47,13 +51,29 @@ torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc_48
 ```
 
 #### Orthostochastic mHC option
-mHC supports an orthostochastic H_res projection via Newton-Schulz. Set `mhc_h_res_proj = "orthostochastic"` in your config and keep `ns_steps`, `ns_eps`, `ns_coeffs` as provided in the mHC configs.
+mHC supports an orthostochastic H_res projection via Newton-Schulz. Set `mhc_h_res_proj = "orthostochastic"` in your config.
+
+By default, configs use fixed Newton-Schulz coefficients (`ns_steps=5`, `ns_coeffs=(3.0, -3.2, 1.2)`). For research, `ns_coeffs` can also be a per-step schedule (tuple of `(a, b, c)` triplets); set `ns_steps = len(ns_coeffs)`.
+
+#### Residual identity-mix (optional)
+For an ablation that keeps residual routing close to identity, enable:
+- `mhc_residual_identity_mix = True`
+- `mhc_residual_alpha = 0.01`
+
+This applies `H_res = (1-α) * I + α * S` where `S` is the projected matrix (Sinkhorn or orthostochastic) and `α` is learned.
+
+#### Value residual (vRes) notes
+- `train_fineweb10B_vres*.py` enables value residual only.
+- `train_fineweb10B_vres_mhc*.py` combines vRes + mHC.
+- `train_fineweb10B_cvres_mhc*.py` combines vRes + mHC with `v_residual_constrained=True` (convex mixing via softmax).
 
 ### Next steps planned
 - [x] Value residual ablations with baseline/HC/mHC
+- [x] Combined vRes + mHC configs (unconstrained + constrained)
 - [ ] AltUP ablation
-- [x] H^res = `(1−α)*I + α*S` instead of full doubly stochastic (branch: `feat/mhc-residual-identity-mix`)
+- [x] H^res = `(1−α)*I + α*S` instead of full doubly stochastic
 - [x] Orthostochastic H_res projection (Newton-Schulz) as alternative to Sinkhorn-Knopp
+- [x] Opt-in Newton-Schulz coefficient schedule for orthostochastic projection
 - [ ] U-net-based variants + value embeddings
 
 
