@@ -53,7 +53,7 @@ mHC supports an orthostochastic H_res projection via Newton-Schulz. Set `mhc_h_r
 - [x] Value residual ablations with baseline/HC/mHC
 - [ ] AltUP ablation
 - [x] H^res = `(1−α)*I + α*S` instead of full doubly stochastic (branch: `feat/mhc-residual-identity-mix`)
-- [ ] Replace sinkhorn-knopp w/ Muon's orthogonalization op
+- [x] Orthostochastic H_res projection (Newton-Schulz) as alternative to Sinkhorn-Knopp
 - [ ] U-net-based variants + value embeddings
 
 
