@@ -1,26 +1,31 @@
-# FineWeb10B with mHC (4 streams)
+# FineWeb10B with constrained vRes + mHC (4 streams, 48 layers)
 # ~20M param GPT-2 style model
 #
+# Combines:
+#   - Constrained Value Residual (softmax mixing)
+#   - mHC (manifold-constrained residual stream routing)
+#
 # Usage:
-#   python train.py config/train_fineweb10B_mhc.py
-#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc.py
+#   python train.py config/train_fineweb10B_cvres_mhc_48l.py
+#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_cvres_mhc_48l.py
 
-out_dir = "out-fineweb10B-mhc"
-wandb_run_name = "mhc"
+out_dir = "out-fineweb10B-cvres-mhc-48l"
+wandb_run_name = "cvres-mhc-48l"
+wandb_project = "mhc-nanogpt-48"
 
 dataset = "fineweb10B"
 
 # model
 block_size = 1024
-n_layer = 6
+n_layer = 48
 n_head = 6
-n_embd = 288
+n_embd = 150
 dropout = 0.0
 bias = False
 
-batch_size = 32
+batch_size = 24
 gradient_accumulation_steps = 4
-max_iters = 5000
+max_iters = 6666
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
@@ -34,7 +39,7 @@ grad_clip = 1.0
 
 # lr schedule
 warmup_iters = 200
-lr_decay_iters = 5000
+lr_decay_iters = 6666
 min_lr = 6e-5
 
 # dtype
@@ -60,9 +65,11 @@ NS_COEFFS = (
     (1.8648, -1.2224, 0.3577),
 )
 
-ns_steps = 5
+ns_steps = len(NS_COEFFS)
 ns_eps = 1e-7
-ns_coeffs = (3.0, -3.2, 1.2)
+ns_coeffs = NS_COEFFS
 
-mhc_residual_identity_mix = False
-mhc_residual_alpha = 0.01
+# value residual (attention-internal, constrained to convex mixing)
+v_residual = True
+v_residual_constrained = True
+v_residual_lamb_lr = 1e-2

@@ -1,12 +1,16 @@
-# FineWeb10B with mHC (4 streams)
+# FineWeb10B with vRes + mHC (4 streams)
 # ~20M param GPT-2 style model
 #
+# Combines:
+#   - Value Residual (unconstrained lamb1/lamb2)
+#   - mHC (manifold-constrained residual stream routing)
+#
 # Usage:
-#   python train.py config/train_fineweb10B_mhc.py
-#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc.py
+#   python train.py config/train_fineweb10B_vres_mhc.py
+#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_vres_mhc.py
 
-out_dir = "out-fineweb10B-mhc"
-wandb_run_name = "mhc"
+out_dir = "out-fineweb10B-vres-mhc"
+wandb_run_name = "vres-mhc"
 
 dataset = "fineweb10B"
 
@@ -48,21 +52,10 @@ mhc = True
 sinkhorn_iters = 10
 sinkhorn_tau = 0.05
 mhc_h_res_proj = "sinkhorn"
-
-NS_COEFFS = (
-    (7.2086, -15.5131, 9.0178),
-    (3.9623, -2.5813, 0.4542),
-    (3.9466, -2.5765, 0.4544),
-    (3.8991, -2.5671, 0.4566),
-    (3.7186, -2.5308, 0.4653),
-    (3.1390, -2.3073, 0.4733),
-    (2.1715, -1.5246, 0.3885),
-    (1.8648, -1.2224, 0.3577),
-)
-
 ns_steps = 5
 ns_eps = 1e-7
 ns_coeffs = (3.0, -3.2, 1.2)
 
-mhc_residual_identity_mix = False
-mhc_residual_alpha = 0.01
+# value residual (unconstrained)
+v_residual = True
+v_residual_lamb_lr = 1e-2
