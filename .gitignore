@@ -209,8 +209,6 @@ __marimo__/
 # mHC project local reference/docs (not tracked)
 reference-hc/
 reference-valueres/
-docs/
-AGENTS.md
 .DS_Store
 examples/nanogpt/out*/
 examples/nanogpt/data/fineweb10B/*.bin
@@ -219,5 +217,4 @@ examples/nanogpt/data/shakespeare_char/*.bin
 examples/nanogpt/data/shakespeare_char/meta.json
 pyrightconfig.json
 mhc_export.tgz
-remote-ops.md
-scripts/
+wandb/
