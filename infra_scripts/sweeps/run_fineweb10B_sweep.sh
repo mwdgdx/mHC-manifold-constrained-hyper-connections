@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$script_dir/../load_project_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$script_dir/../load_project_env.sh"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: run_fineweb10B_sweep.sh [options]

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$script_dir/load_project_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$script_dir/load_project_env.sh"
+fi
+
 # Small remote training run for nanoGPT HyperConnections.
 # Designed to be executed on a GPU pod via `lium exec <pod> --script infra_scripts/pod-hc-small-run.sh`.
 #

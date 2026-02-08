@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$script_dir/load_project_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$script_dir/load_project_env.sh"
+fi
+
 POD_NAME="${LIUM_POD_NAME:-my-gpu-pod}"
 DEFAULT_GPU="${LIUM_DEFAULT_GPU:-A100}"
 DEFAULT_VOLUME_NAME="${LIUM_DEFAULT_VOLUME:-my_volume}"
