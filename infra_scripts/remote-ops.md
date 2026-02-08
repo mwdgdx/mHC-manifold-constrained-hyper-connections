@@ -23,18 +23,9 @@ We assume a durable volume is always attached and mounted at `/mnt`.
 Do not generate new Git SSH keys per pod. Use the keys stored on the persistent volume.
 
 - Preferred location on volume: `/mnt/.ssh` (fallback: `/mnt/ssh`).
-- `infra_scripts/pod-fastpath.sh` will link the volume SSH directory into `~/.ssh` automatically.
-- If doing it manually inside a pod:
-```bash
-if [[ -d /mnt/.ssh ]]; then
-  rm -rf ~/.ssh
-  ln -s /mnt/.ssh ~/.ssh
-elif [[ -d /mnt/ssh ]]; then
-  rm -rf ~/.ssh
-  ln -s /mnt/ssh ~/.ssh
-fi
-ssh -T git@github.com || true
-```
+- `infra_scripts/pod-fastpath.sh` will copy persisted keys/config into `~/.ssh` automatically.
+
+Important: do NOT replace `~/.ssh` with a symlink to `/mnt`. Pod providers inject `authorized_keys` into `~/.ssh`, and replacing the directory can lock you out.
 
 ## Common Workflows
 
@@ -95,6 +86,16 @@ Secrets note: keep API keys out of these env files. Use `wandb login` (writes `~
 
 The sweep runner executes a CSV manifest and writes each run to `${OPS_REMOTE_OUTPUTS_DIR}/<run_id>/`.
 
+If you want the simplest possible flow, run:
+
+```bash
+# Inside the pod
+cd /root/work/mHC-manifold-constrained-hyper-connections
+bash infra_scripts/sweeps/one_click_fineweb10B_sweep.sh
+```
+
+This uses `infra_scripts/sweeps/fineweb10B_sweep_config.sh` (hardcoded defaults) and starts an 8-shard tmux session.
+
 ```bash
 # Inside the repo on the pod
 export OPS_REMOTE_OUTPUTS_DIR=/mnt/pod_artifacts/outputs
@@ -115,6 +116,9 @@ Useful flags:
 - `--dry-run`: print commands only
 - `--no-wandb`: disable W&B logging
 - `--device cuda|cpu|mps`: force device override
+
+Status summary:
+- `python3 infra_scripts/sweeps/sweep_status.py`
 
 ### Using all GPUs on an 8x node
 

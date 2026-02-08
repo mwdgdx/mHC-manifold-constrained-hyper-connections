@@ -34,13 +34,11 @@ mkdir -p /root/work
 cd /root/work
 
 # Ensure persisted SSH keys are active before cloning (preferred)
-if [[ -d /mnt/.ssh ]]; then
-  rm -rf ~/.ssh
-  ln -s /mnt/.ssh ~/.ssh
-elif [[ -d /mnt/ssh ]]; then
-  rm -rf ~/.ssh
-  ln -s /mnt/ssh ~/.ssh
-fi
+#
+# IMPORTANT: do NOT replace ~/.ssh with a symlink to /mnt. Pod providers inject
+# authorized_keys into ~/.ssh, and replacing the directory can lock you out.
+#
+# Use infra_scripts/pod-fastpath.sh (recommended) to copy keys from /mnt into ~/.ssh.
 
 # Clone once per pod (repo is NOT on /mnt)
 if [[ ! -d /root/work/mHC-manifold-constrained-hyper-connections/.git ]]; then
@@ -63,7 +61,7 @@ Notes:
 We keep Git SSH keys on the persistent volume so pods do not need to generate new keys.
 
 - Store keys on the mounted volume at `/mnt/.ssh` (preferred) or `/mnt/ssh`.
-- `infra_scripts/pod-fastpath.sh` links `/mnt/.ssh` (or `/mnt/ssh`) into `~/.ssh` automatically.
+- `infra_scripts/pod-fastpath.sh` copies persisted keys/config from `/mnt/.ssh` (or `/mnt/ssh`) into `~/.ssh` automatically.
 - Disable this behavior only if necessary: `--no-ssh`.
 
 Tip: If `/mnt/setup-github-ssh.sh` exists on the volume, you can run it to ensure `known_hosts` and `ssh-agent` are set up.
