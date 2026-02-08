@@ -13,8 +13,8 @@ Manage remote pods, vLLM servers, and evaluation runs using the deterministic op
 
 We assume a durable volume is always attached and mounted at `/mnt`.
 
-- Standard volume: `my_volume` (currently HUID `calm-orbit-4b`; verify with `lium volumes list`).
-- Prefer `infra_scripts/lium-pod.sh up ...` which attaches `my_volume` by default; opt-out only when necessary with `--no-volume`.
+- Standard volume: `${LIUM_DEFAULT_VOLUME:-my_volume}` (verify with `lium volumes list`).
+- Prefer `infra_scripts/lium-pod.sh up ...` which attaches `${LIUM_DEFAULT_VOLUME:-my_volume}` by default; opt-out only when necessary with `--no-volume`.
 - Use `/mnt` for heavy/persistent state: datasets, HuggingFace cache, experiment outputs, and SSH keys for Git.
 - Do NOT put `uv`/`pip` caches on `/mnt` (it is slower); keep those caches on the pod's local disk.
 
@@ -40,20 +40,20 @@ ssh -T git@github.com || true
 
 ```bash
 # Infra check (host reachable + /mnt mounted)
-python3 infra_scripts/ops.py pod status --host lium
+python3 infra_scripts/ops.py pod status --host "${OPS_DEFAULT_HOST:-lium}"
 
 # vLLM lifecycle
-python3 infra_scripts/ops.py vllm start --host lium --model-id Qwen/Qwen3-4B-Instruct-2507 --tensor-parallel-size 8
-python3 infra_scripts/ops.py vllm status --host lium
-python3 infra_scripts/ops.py vllm stop --host lium
+python3 infra_scripts/ops.py vllm start --host "${OPS_DEFAULT_HOST:-lium}" --model-id Qwen/Qwen3-4B-Instruct-2507 --tensor-parallel-size 8
+python3 infra_scripts/ops.py vllm status --host "${OPS_DEFAULT_HOST:-lium}"
+python3 infra_scripts/ops.py vllm stop --host "${OPS_DEFAULT_HOST:-lium}"
 
 # Submit and monitor a run
-python3 infra_scripts/ops.py runs submit --host lium --config configs/pilots.json
-python3 infra_scripts/ops.py runs status --host lium --run-id <run_id>
+python3 infra_scripts/ops.py runs submit --host "${OPS_DEFAULT_HOST:-lium}" --config configs/pilots.json
+python3 infra_scripts/ops.py runs status --host "${OPS_DEFAULT_HOST:-lium}" --run-id <run_id>
 
 # Archive, fetch, and report
-python3 infra_scripts/ops.py artifacts archive --host lium --run-id <run_id>
-python3 infra_scripts/ops.py artifacts fetch --host lium --run-id <run_id>
+python3 infra_scripts/ops.py artifacts archive --host "${OPS_DEFAULT_HOST:-lium}" --run-id <run_id>
+python3 infra_scripts/ops.py artifacts fetch --host "${OPS_DEFAULT_HOST:-lium}" --run-id <run_id>
 python3 infra_scripts/ops.py report --root artifacts/pod_logs
 ```
 
@@ -116,6 +116,7 @@ All commands support `--json` (compact), `--pretty` (indented), and `--dry-run`.
 
 **Provisioning**
 - Use `infra_scripts/lium-pod.sh` to manage pods. Standard volume for ops is `my_volume`.
+- Use `infra_scripts/lium-pod.sh` to manage pods. Standard volume for ops is `${LIUM_DEFAULT_VOLUME:-my_volume}`.
 ```bash
 # Recommended: pick an exact executor (includes GPU count + variant)
 lium-pod.sh ls A100
@@ -164,6 +165,9 @@ git pull
 | `OPS_DEFAULT_HOST` | Default SSH host for commands. | `lium` |
 | `OPS_REMOTE_REPO` | Repo path for `runs submit`. | - |
 | `OPS_REMOTE_OUTPUTS_DIR` | Default remote output root for run directories. | `/mnt/pod_artifacts/outputs` |
+| `LIUM_DEFAULT_VOLUME` | Default Lium volume name for `lium-pod.sh up`. | `my_volume` |
+| `DATA_DIR` | Default FineWeb data directory (used by sweep runner). | `/mnt/data/fineweb10B` |
+| `OPS_PROJECT_ENV` | Optional env file path sourced by infra scripts. | - |
 | `VLLM_BASE_URL` | Base URL for vLLM status checks. | `http://127.0.0.1:8000/v1` |
 | `OPENAI_API_BASE` | Fallback for vLLM status checks. | - |
 | `OPENAI_API_KEY` | Required for some eval environments. | - |

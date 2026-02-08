@@ -4,17 +4,23 @@ Run compute from fast local disk (root) while keeping data and artifacts on `/mn
 
 ## Conventions
 
-- Repo (fast): `/root/work/mHC-manifold-constrained-hyper-connections`
-- Persistent volume: `my_volume` mounted at `/mnt`
-- Data (durable): `/mnt/data/fineweb10B`
-- Outputs (durable): `/mnt/experiments/mhc`
-- Ops repo pointer: `OPS_REMOTE_REPO=/root/work/mHC-manifold-constrained-hyper-connections`
+- Repo (fast): `${OPS_REMOTE_REPO:-/root/work/mHC-manifold-constrained-hyper-connections}`
+- Persistent volume: `${LIUM_DEFAULT_VOLUME:-my_volume}` mounted at `/mnt`
+- Data (durable): `${DATA_DIR:-/mnt/data/fineweb10B}`
+- Outputs (durable): `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}`
+
+Tip: copy and customize `infra_scripts/project.env.example` to `/mnt/project.env` so infra scripts pick up consistent defaults.
 
 ## Setup (one-time per pod)
 
 ```bash
 # Bootstrapping (installs base tools, configures tokens/keys)
 bash /mnt/bootstrap-pod.sh
+
+# Optional: standardize env defaults for all infra scripts
+cp -n /root/work/mHC-manifold-constrained-hyper-connections/infra_scripts/project.env.example /mnt/project.env || true
+# edit /mnt/project.env as needed
+# source /mnt/project.env
 
 # Ensure W&B is configured for non-interactive sessions (writes ~/.netrc)
 bash /mnt/set-wandb-api-key.sh
@@ -72,11 +78,11 @@ infra_scripts/pod-smoke-run.sh --run-id pr-smoke-$(date +%Y%m%d-%H%M%S)
 Defaults:
 - `max_iters=20`, `eval_interval=10`, `eval_iters=5`
 - `wandb_log=auto` (enabled when W&B creds exist: `WANDB_API_KEY` or `~/.netrc`)
-- Runs in `tmux` and syncs to `/mnt/experiments/mhc/<run-id>`
+- Runs in `tmux` and writes to `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run-id>`
 
 Log paths:
-- Local: `examples/nanogpt/out/<run-id>/terminal.log`
-- Watch: `examples/nanogpt/out/<run-id>/watch.log`
+- Stdout: `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run-id>/stdout.log`
+- Watch: `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run-id>/watch.log`
 
 ## Manual Sync
 
@@ -88,7 +94,7 @@ infra_scripts/pod-sync.sh --run-id <run-id>
 
 ```bash
 export OPS_REMOTE_REPO=/root/work/mHC-manifold-constrained-hyper-connections
-python infra_scripts/ops.py runs submit --host lium --config configs/pilots.json
+python infra_scripts/ops.py runs submit --host "${OPS_DEFAULT_HOST:-lium}" --config configs/pilots.json
 ```
 
 `runs submit` now requires `remote_repo` (config, `OPS_REMOTE_REPO`, or `--remote-repo`).

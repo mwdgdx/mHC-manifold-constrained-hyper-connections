@@ -53,7 +53,8 @@ Everything else is optional but highly recommended (`config_effective.json`, `en
 
 Today there are two “artifact contracts”:
 
-- Training scripts + pod runners naturally write to `/mnt/experiments/mhc/<run-id>` and do not emit the `ops.py` contract files.
+- Training scripts + pod runners historically wrote to project-specific roots (e.g. `/mnt/experiments/mhc/<run-id>`) and did not emit the `ops.py` contract files.
+- Current contract target is `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run_id>/` with `summary.json` as the completion marker.
 - `infra_scripts/ops.py` expects `/mnt/pod_artifacts/outputs/<run-id>` and uses `summary.json` as the completion marker.
 
 Recommendation:

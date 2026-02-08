@@ -41,6 +41,8 @@ Constraints (mHC mode):
 | Sweep runner | `infra_scripts/sweeps/run_fineweb10B_sweep.sh` | executes CSV runs to `${OPS_REMOTE_OUTPUTS_DIR}/<run_id>` |
 | Remote ops docs | `infra_scripts/remote-ops.md` | pod setup, run artifact contract, ops commands |
 | Ops blueprint | `infra_scripts/research-ops-blueprint.md` | infra design memo + future ops roadmap |
+| Infra env template | `infra_scripts/project.env.example` | env defaults for pods/sweeps (no secrets) |
+| Infra env loader | `infra_scripts/load_project_env.sh` | sources `/mnt/project.env` and other env files |
 | Tests | `tests/test_hyper_connections.py` | constraints, shapes, gradients |
 
 ## Code Map (Key Symbols)
