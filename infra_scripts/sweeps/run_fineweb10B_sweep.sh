@@ -17,6 +17,9 @@ Options:
   --out-root <path>     Output root (default: $OPS_REMOTE_OUTPUTS_DIR or /mnt/pod_artifacts/outputs)
   --data-dir <path>     FineWeb data dir (default: /mnt/data/fineweb10B)
   --wandb-group <name>  W&B group label (default: fineweb10B-sweep-YYYYMMDD)
+  --shard-index <i>     Only run rows where (row_index % shard_count) == shard_index
+  --shard-count <n>     Total number of shards (default: 1)
+  --cuda-devices <str>  Set CUDA_VISIBLE_DEVICES for each run (e.g., "0" or "0,1")
   --device <dev>        Force device override (e.g., cuda, mps, cpu)
   --match <substr>      Only run rows whose run_id contains this substring
   --start-at <run_id>   Skip until the given run_id is reached
@@ -34,6 +37,9 @@ OUT_ROOT="${OUT_ROOT:-${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}}"
 DATA_DIR="${DATA_DIR:-/mnt/data/fineweb10B}"
 WANDB_GROUP="${WANDB_GROUP:-fineweb10B-sweep-$(date +%Y%m%d)}"
 WANDB_LOG_PY="${WANDB_LOG_PY:-True}"
+SHARD_INDEX="${SHARD_INDEX:-0}"
+SHARD_COUNT="${SHARD_COUNT:-1}"
+CUDA_DEVICES="${CUDA_DEVICES:-}"
 DEVICE=""
 MATCH=""
 START_AT=""
@@ -61,6 +67,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --wandb-group)
       WANDB_GROUP="$2"
+      shift 2
+      ;;
+    --shard-index)
+      SHARD_INDEX="$2"
+      shift 2
+      ;;
+    --shard-count)
+      SHARD_COUNT="$2"
+      shift 2
+      ;;
+    --cuda-devices)
+      CUDA_DEVICES="$2"
       shift 2
       ;;
     --device)
@@ -106,6 +124,15 @@ done
 if [[ ! -f "$CSV" ]]; then
   echo "Missing CSV: $CSV"
   exit 1
+fi
+
+if ! [[ "$SHARD_INDEX" =~ ^[0-9]+$ && "$SHARD_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "Invalid shard params: shard_index=$SHARD_INDEX shard_count=$SHARD_COUNT" >&2
+  exit 2
+fi
+if [[ "$SHARD_COUNT" -lt 1 || "$SHARD_INDEX" -ge "$SHARD_COUNT" ]]; then
+  echo "Invalid shard params: shard_index=$SHARD_INDEX shard_count=$SHARD_COUNT" >&2
+  exit 2
 fi
 
 PYTHON="${PYTHON:-$WORKDIR/.venv/bin/python}"
@@ -157,6 +184,7 @@ backup_run_files() {
 }
 
 run_count=0
+row_index=0
 started=false
 if [[ -z "$START_AT" ]]; then
   started=true
@@ -166,6 +194,9 @@ while IFS=, read -r run_id config seed overrides notes; do
   if [[ "$run_id" == "run_id" ]]; then
     continue
   fi
+
+  row_mod=$((row_index % SHARD_COUNT))
+  row_index=$((row_index + 1))
 
   run_id="$(strip_quotes "$run_id")"
   config="$(strip_quotes "$config")"
@@ -181,6 +212,10 @@ while IFS=, read -r run_id config seed overrides notes; do
   fi
 
   if [[ -n "$MATCH" && "$run_id" != *"$MATCH"* ]]; then
+    continue
+  fi
+
+  if [[ "$row_mod" -ne "$SHARD_INDEX" ]]; then
     continue
   fi
 
@@ -238,7 +273,11 @@ while IFS=, read -r run_id config seed overrides notes; do
 
   (
     cd "$WORKDIR/examples/nanogpt"
-    "${cmd[@]}" > "$run_dir/stdout.log" 2>&1
+    if [[ -n "$CUDA_DEVICES" ]]; then
+      CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${cmd[@]}" > "$run_dir/stdout.log" 2>&1
+    else
+      "${cmd[@]}" > "$run_dir/stdout.log" 2>&1
+    fi
   )
 
   if [[ ! -f "$summary_path" ]]; then
