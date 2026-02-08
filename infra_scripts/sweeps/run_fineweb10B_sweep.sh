@@ -33,7 +33,7 @@ WORKDIR="${WORKDIR:-${OPS_REMOTE_REPO:-/root/work/mHC-manifold-constrained-hyper
 OUT_ROOT="${OUT_ROOT:-${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}}"
 DATA_DIR="${DATA_DIR:-/mnt/data/fineweb10B}"
 WANDB_GROUP="${WANDB_GROUP:-fineweb10B-sweep-$(date +%Y%m%d)}"
-WANDB_LOG="${WANDB_LOG:-true}"
+WANDB_LOG_PY="${WANDB_LOG_PY:-True}"
 DEVICE=""
 MATCH=""
 START_AT=""
@@ -88,7 +88,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-wandb)
-      WANDB_LOG="false"
+      WANDB_LOG_PY="False"
       shift
       ;;
     -h|--help)
@@ -120,6 +120,40 @@ strip_quotes() {
   value="${value%\'}"
   value="${value#\'}"
   printf '%s' "$value"
+}
+
+python_bool() {
+  # Normalize truthy/falsy strings to Python literals.
+  case "${1,,}" in
+    true|1|yes|y) echo "True";;
+    false|0|no|n) echo "False";;
+    *) echo "$1";;
+  esac
+}
+
+summary_ok() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, "r"))
+except Exception:
+    sys.exit(2)
+sys.exit(0 if data.get("ok") is True else 1)
+PY
+}
+
+backup_run_files() {
+  local run_dir="$1"
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+
+  for f in stdout.log summary.json; do
+    if [[ -f "$run_dir/$f" ]]; then
+      mv "$run_dir/$f" "$run_dir/$f.bak-$stamp"
+    fi
+  done
 }
 
 run_count=0
@@ -158,18 +192,26 @@ while IFS=, read -r run_id config seed overrides notes; do
   summary_path="$run_dir/summary.json"
 
   if [[ -f "$summary_path" && "$FORCE" == "false" ]]; then
-    echo "skip: $run_id (summary.json exists)"
-    continue
+    if summary_ok "$summary_path"; then
+      echo "skip: $run_id (summary.json ok=true)"
+      continue
+    fi
+
+    echo "error: $run_id has summary.json but ok!=true; rerun with --force" >&2
+    exit 2
   fi
 
   mkdir -p "$run_dir"
+  if [[ "$FORCE" == "true" ]]; then
+    backup_run_files "$run_dir"
+  fi
 
   cmd=(
     "$PYTHON" "train.py" "$config"
     "out_dir=$run_dir"
     "data_dir=$DATA_DIR"
     "seed=$seed"
-    "wandb_log=$WANDB_LOG"
+    "wandb_log=$WANDB_LOG_PY"
     "wandb_group=$WANDB_GROUP"
     "wandb_run_name=$run_id"
   )
@@ -201,6 +243,11 @@ while IFS=, read -r run_id config seed overrides notes; do
 
   if [[ ! -f "$summary_path" ]]; then
     echo "error: missing summary.json for $run_id"
+    exit 1
+  fi
+
+  if ! summary_ok "$summary_path"; then
+    echo "error: summary.json ok!=true for $run_id" >&2
     exit 1
   fi
 
