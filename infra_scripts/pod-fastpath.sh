@@ -14,7 +14,7 @@ Usage: pod-fastpath.sh [options]
 Options:
   --workdir <path>      Repo path on fast disk (default: /root/work/mHC-manifold-constrained-hyper-connections)
   --data-dir <path>     FineWeb data root (default: /mnt/data/fineweb10B)
-  --out-root <path>     Persistent output root (default: /mnt/experiments/mhc)
+  --out-root <path>     Persistent output root (default: $OPS_REMOTE_OUTPUTS_DIR or /mnt/pod_artifacts/outputs)
   --repo-url <url>      Git repo URL (default: https://github.com/tokenbender/mHC-manifold-constrained-hyper-connections.git)
   --branch <name>       Branch to checkout (optional)
   --pr <number>         GitHub PR number to checkout (optional)
@@ -32,7 +32,7 @@ EOF
 
 WORKDIR="${WORKDIR:-/root/work/mHC-manifold-constrained-hyper-connections}"
 DATA_DIR="${DATA_DIR:-/mnt/data/fineweb10B}"
-OUT_ROOT="${OUT_ROOT:-/mnt/experiments/mhc}"
+OUT_ROOT="${OUT_ROOT:-${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}}"
 REPO_URL="${REPO_URL:-https://github.com/tokenbender/mHC-manifold-constrained-hyper-connections.git}"
 BRANCH="${BRANCH:-}"
 PR_NUMBER="${PR_NUMBER:-}"
