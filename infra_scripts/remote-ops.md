@@ -77,6 +77,49 @@ A completed run MUST produce a directory containing the following files:
 - `examples/nanogpt/train.py` writes `command.sh`, `run_metadata.json`, `config_effective.json`, `dataset_manifest.json`, and `summary.json` into `out_dir` (master process).
 - To satisfy this contract end-to-end, set `out_dir=${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run_id>` and capture console output to `stdout.log` (the pod runner scripts in `infra_scripts/` do this by default).
 
+## Project Env Loading (Recommended)
+
+Infra shell scripts support a shared env file so docs and commands do not hardcode paths.
+
+- Recommended: place a customized env file at `/mnt/project.env` (persistent across pods).
+  - Start from `infra_scripts/project.env.example` (no secrets).
+- Infra scripts will auto-source `infra_scripts/load_project_env.sh` when present.
+- Loading precedence (lowest -> highest):
+  - `/mnt/project.env`
+  - `infra_scripts/project.env` (repo-local; gitignored)
+  - `OPS_PROJECT_ENV` (explicit path)
+
+Secrets note: keep API keys out of these env files. Use `wandb login` (writes `~/.netrc`) and service-specific auth.
+
+## Sweeps (nanoGPT FineWeb10B)
+
+The sweep runner executes a CSV manifest and writes each run to `${OPS_REMOTE_OUTPUTS_DIR}/<run_id>/`.
+
+```bash
+# Inside the repo on the pod
+export OPS_REMOTE_OUTPUTS_DIR=/mnt/pod_artifacts/outputs
+export DATA_DIR=/mnt/data/fineweb10B
+export WANDB_GROUP=fineweb10B-sweep-$(date +%Y%m%d)
+
+bash infra_scripts/sweeps/run_fineweb10B_sweep.sh \
+  --csv infra_scripts/sweeps/fineweb10B_full_sweep.csv \
+  --data-dir "$DATA_DIR" \
+  --wandb-group "$WANDB_GROUP"
+```
+
+Useful flags:
+- `--match <substr>`: run a subset (e.g. only `mhc-6l` rows)
+- `--start-at <run_id>`: resume from a specific row
+- `--limit <n>`: stop after N rows
+- `--force`: rerun even if `<run_dir>/summary.json` exists
+- `--dry-run`: print commands only
+- `--no-wandb`: disable W&B logging
+- `--device cuda|cpu|mps`: force device override
+
+W&B conventions:
+- `wandb_group` should identify the sweep (e.g. `fineweb10B-sweep-YYYYMMDD`).
+- `wandb_run_name` is set to `run_id` so W&B runs match run directories exactly.
+
 ## Ops CLI Reference (`infra_scripts/ops.py`)
 
 All commands support `--json` (compact), `--pretty` (indented), and `--dry-run`.

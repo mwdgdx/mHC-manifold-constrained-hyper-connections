@@ -98,3 +98,26 @@ python infra_scripts/ops.py runs submit --host "${OPS_DEFAULT_HOST:-lium}" --con
 ```
 
 `runs submit` now requires `remote_repo` (config, `OPS_REMOTE_REPO`, or `--remote-repo`).
+
+## Sweeps
+
+The sweep runner executes `infra_scripts/sweeps/fineweb10B_full_sweep.csv` and writes each run to `${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}/<run_id>/`.
+
+```bash
+cd /root/work/mHC-manifold-constrained-hyper-connections
+
+# Optional: ensure env defaults are set once
+cp -n infra_scripts/project.env.example /mnt/project.env || true
+
+export WANDB_GROUP=fineweb10B-sweep-$(date +%Y%m%d)
+
+bash infra_scripts/sweeps/run_fineweb10B_sweep.sh \
+  --csv infra_scripts/sweeps/fineweb10B_full_sweep.csv \
+  --wandb-group "$WANDB_GROUP"
+```
+
+Useful flags:
+- `--match <substr>` for subsets
+- `--start-at <run_id>` to resume
+- `--limit <n>` for a short pilot
+- `--dry-run` to print commands without running
