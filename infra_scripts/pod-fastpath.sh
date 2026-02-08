@@ -116,24 +116,44 @@ setup_ssh_from_mnt() {
     return 2
   fi
 
-  if [[ -e "$HOME/.ssh" && ! -L "$HOME/.ssh" ]]; then
-    mv "$HOME/.ssh" "$HOME/.ssh.bak-$(date +%Y%m%d-%H%M%S)"
-  elif [[ -L "$HOME/.ssh" ]]; then
+  # IMPORTANT: do not replace $HOME/.ssh with a symlink to /mnt.
+  # Pod providers (including Lium) inject authorized_keys into $HOME/.ssh.
+  # Replacing the directory will lock you out of the pod.
+  if [[ -L "$HOME/.ssh" ]]; then
     rm -f "$HOME/.ssh"
   fi
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh" 2>/dev/null || true
 
-  ln -s "$candidate" "$HOME/.ssh"
-
-  chmod 700 "$candidate" 2>/dev/null || true
-  if command -v find >/dev/null 2>&1; then
-    find "$candidate" -maxdepth 1 -type f -name 'id_*' ! -name '*.pub' -exec chmod 600 {} + 2>/dev/null || true
+  # Copy persisted keys/config into $HOME/.ssh without touching authorized_keys.
+  shopt -s nullglob
+  if [[ -f "$candidate/config" ]]; then
+    cp -f "$candidate/config" "$HOME/.ssh/config"
+    chmod 600 "$HOME/.ssh/config" 2>/dev/null || true
   fi
+  for key in "$candidate"/id_*; do
+    if [[ -f "$key" ]]; then
+      base=$(basename "$key")
+      # Skip any authorized_keys-like file just in case.
+      if [[ "$base" == "authorized_keys" ]]; then
+        continue
+      fi
+      cp -f "$key" "$HOME/.ssh/$base"
+      if [[ "$base" != *.pub ]]; then
+        chmod 600 "$HOME/.ssh/$base" 2>/dev/null || true
+      fi
+    fi
+  done
 
-  mkdir -p "$candidate"
-  touch "$candidate/known_hosts"
+  if [[ -f "$candidate/known_hosts" ]]; then
+    cat "$candidate/known_hosts" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+  fi
+  touch "$HOME/.ssh/known_hosts"
+  chmod 600 "$HOME/.ssh/known_hosts" 2>/dev/null || true
   if command -v ssh-keyscan >/dev/null 2>&1; then
-    ssh-keyscan -H github.com >> "$candidate/known_hosts" 2>/dev/null || true
+    ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
   fi
+  shopt -u nullglob
 }
 
 mkdir -p "$(dirname "$WORKDIR")"
