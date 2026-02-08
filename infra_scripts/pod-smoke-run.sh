@@ -159,7 +159,7 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 2
 fi
 
-DATA_DIR="$WORKDIR/examples/nanogpt/data/fineweb10B"
+DATA_DIR="${DATA_DIR:-/mnt/data/fineweb10B}"
 train_shard=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | head -n 1 || true)
 val_shard=$(ls "$DATA_DIR"/fineweb_val_*.bin 2>/dev/null | head -n 1 || true)
 if [[ -z "$train_shard" || -z "$val_shard" ]]; then
@@ -211,6 +211,7 @@ cmd=(
   "WANDB_CACHE_DIR=/mnt/wandb-cache"
   "WANDB_CONFIG_DIR=/mnt/wandb-config"
   "$PYTHON" "train.py" "$CONFIG"
+  "data_dir=$DATA_DIR"
   "max_iters=$MAX_ITERS"
   "eval_interval=$EVAL_INTERVAL"
   "eval_iters=$EVAL_ITERS"

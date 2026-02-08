@@ -15,7 +15,9 @@ import sys
 from huggingface_hub import hf_hub_download
 
 REPO_ID = "kjj0/fineweb10B-gpt2"
-LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_DIR = os.environ.get(
+    "FINEWEB10B_LOCAL_DIR", os.path.dirname(os.path.abspath(__file__))
+)
 
 
 def download_shard(fname):

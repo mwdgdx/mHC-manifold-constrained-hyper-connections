@@ -184,27 +184,13 @@ fi
 mkdir -p "$DATA_DIR"
 mkdir -p "$OUT_ROOT"
 
-LINK_PATH="$WORKDIR/examples/nanogpt/data/fineweb10B"
-if [[ -L "$LINK_PATH" ]]; then
-  LINK_TARGET="$(readlink -f "$LINK_PATH")"
-  if [[ "$LINK_TARGET" != "$(readlink -f "$DATA_DIR")" ]]; then
-    echo "fineweb10B link points to $LINK_TARGET, expected $DATA_DIR" >&2
-    exit 2
-  fi
-elif [[ -e "$LINK_PATH" ]]; then
-  echo "fineweb10B path exists and is not a symlink: $LINK_PATH" >&2
-  exit 2
-else
-  ln -s "$DATA_DIR" "$LINK_PATH"
-fi
-
 train_shard=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | head -n 1 || true)
 val_shard=$(ls "$DATA_DIR"/fineweb_val_*.bin 2>/dev/null | head -n 1 || true)
 
 if [[ -z "$train_shard" || -z "$val_shard" ]]; then
   if [[ "$DOWNLOAD_FINEWEB" == "1" ]]; then
     "$WORKDIR/.venv/bin/python" -m pip install -q huggingface_hub
-    "$WORKDIR/.venv/bin/python" "$WORKDIR/examples/nanogpt/data/fineweb10B/download.py" 1
+    FINEWEB10B_LOCAL_DIR="$DATA_DIR" "$WORKDIR/.venv/bin/python" "$WORKDIR/examples/nanogpt/data/fineweb10B/download.py" 1
   else
     echo "FineWeb shards missing in $DATA_DIR" >&2
     echo "Run with --download-fineweb or set DOWNLOAD_FINEWEB=1" >&2
