@@ -121,3 +121,23 @@ Useful flags:
 - `--start-at <run_id>` to resume
 - `--limit <n>` for a short pilot
 - `--dry-run` to print commands without running
+
+### Multi-GPU sweep (recommended)
+
+Each run uses a single GPU by default. To use all GPUs on an 8x node, run 8 sweep shards in parallel (one per GPU):
+
+```bash
+cd /root/work/mHC-manifold-constrained-hyper-connections
+source infra_scripts/load_project_env.sh
+
+tmux new -As sweeps
+
+bash infra_scripts/sweeps/start_fineweb10B_sweep_tmux.sh \
+  --csv infra_scripts/sweeps/fineweb10B_full_sweep.csv \
+  --workdir "${OPS_REMOTE_REPO:-/root/work/mHC-manifold-constrained-hyper-connections}" \
+  --out-root "${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}" \
+  --data-dir "${DATA_DIR:-/mnt/data/fineweb10B}" \
+  --wandb-group "${WANDB_GROUP:-fineweb10B-sweep-$(date +%Y%m%d)}" \
+  --shards 8 \
+  --no-wandb
+```

@@ -116,6 +116,30 @@ Useful flags:
 - `--no-wandb`: disable W&B logging
 - `--device cuda|cpu|mps`: force device override
 
+### Using all GPUs on an 8x node
+
+By default, each `train.py` run uses a single GPU. For sweeps, the fastest way to use all GPUs is to run multiple independent sweep shards in parallel (one per GPU).
+
+```bash
+# Inside the pod
+cd /root/work/mHC-manifold-constrained-hyper-connections
+
+source infra_scripts/load_project_env.sh
+
+tmux new -As sweeps
+
+# Start 8 shards (one per GPU), each writing to the same OUT_ROOT.
+# Each shard runs a disjoint subset of CSV rows.
+bash infra_scripts/sweeps/start_fineweb10B_sweep_tmux.sh \
+  --csv infra_scripts/sweeps/fineweb10B_full_sweep.csv \
+  --workdir "${OPS_REMOTE_REPO:-/root/work/mHC-manifold-constrained-hyper-connections}" \
+  --out-root "${OPS_REMOTE_OUTPUTS_DIR:-/mnt/pod_artifacts/outputs}" \
+  --data-dir "${DATA_DIR:-/mnt/data/fineweb10B}" \
+  --wandb-group "${WANDB_GROUP:-fineweb10B-sweep-$(date +%Y%m%d)}" \
+  --shards 8 \
+  --no-wandb
+```
+
 W&B conventions:
 - `wandb_group` should identify the sweep (e.g. `fineweb10B-sweep-YYYYMMDD`).
 - `wandb_run_name` is set to `run_id` so W&B runs match run directories exactly.
