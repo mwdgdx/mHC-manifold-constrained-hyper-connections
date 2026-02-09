@@ -195,12 +195,12 @@ Commands (local entrypoints):
 
   sweep-csv-template         Create a starter sweep CSV at SWEEP_CSV (local)
   workflow-sync              Upload this workflow script into the remote repo
-  sweep-start                Upload sweep CSV + start tmux shard windows running the sweep
+  sweep-start                Upload sweep CSV + start a sequential torchrun sweep in tmux
   sweep-status               Summarize sweep progress from SWEEP_CSV + outputs root
   fetch-run <run_id>         Fetch a single run directory into LOCAL_ARTIFACTS_DIR/<run_id>/
 
 Commands (remote/internal):
-  _sweep_shard ...           Runs one shard loop (used by tmux windows)
+  _sweep_run_all             Runs the sweep sequentially (used by tmux window)
   _sweep_status              Prints progress summary (used by sweep-status)
 EOF
 }
@@ -1089,10 +1089,9 @@ cmd_sweep_start() {
   require_var OPS_REMOTE_OUTPUTS_DIR
   remote_exec_env 'ts="$(date +%Y%m%d-%H%M%S)"; mkdir -p "$OPS_REMOTE_OUTPUTS_DIR/_manifests"; if [[ "$SWEEP_CSV" = /* ]]; then csv="$SWEEP_CSV"; else csv="$OPS_REMOTE_REPO/$SWEEP_CSV"; fi; cp -f "$csv" "$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-${ts}.csv"; cp -f "$REMOTE_ENV_PATH" "$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-${ts}.env"'
 
-  require_var SWEEP_SHARDS
   require_var SWEEP_TMUX_SESSION
 
-  remote_exec_env 'session="$SWEEP_TMUX_SESSION"; shards="$SWEEP_SHARDS"; tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session" -n overview; tmux set-option -t "$session" remain-on-exit on; for i in $(seq 0 $((shards - 1))); do w="shard-$i"; tmux list-windows -t "$session" -F "#{window_name}" | grep -qx "$w" && continue; run_cmd="cd \"$OPS_REMOTE_REPO\" && CUDA_VISIBLE_DEVICES=$i WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash infra_scripts/workflow.sh _sweep_shard --shard-index $i --shard-count $shards"; tmux new-window -t "$session" -n "$w" "bash -lc $(printf %q "$run_cmd")"; done; echo "tmux attach -t $session"'
+  remote_exec_env 'session="$SWEEP_TMUX_SESSION"; tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session" -n overview; tmux set-option -t "$session" remain-on-exit on; tmux list-windows -t "$session" -F "#{window_name}" | grep -qx "sweep" && tmux kill-window -t "$session":sweep 2>/dev/null || true; run_cmd="cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash infra_scripts/workflow.sh _sweep_run_all"; tmux new-window -t "$session" -n sweep "bash -lc $(printf %q "$run_cmd")"; echo "tmux attach -t $session"'
 }
 
 strip_quotes() {
@@ -1117,7 +1116,43 @@ except Exception:
 PY
 }
 
-cmd__sweep_shard() {
+detect_visible_gpu_count() {
+  # Determine how many GPUs are visible to this process.
+  # Preference order:
+  # 1) CUDA_VISIBLE_DEVICES (explicit visibility)
+  # 2) nvidia-smi (system visibility)
+  # 3) torch.cuda.device_count() via repo venv
+  local venv_python="$1"
+
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    local count=0
+    local part
+    IFS=',' read -r -a parts <<<"${CUDA_VISIBLE_DEVICES}"
+    for part in "${parts[@]}"; do
+      part="${part//[[:space:]]/}"
+      [[ -n "$part" ]] || continue
+      count=$((count + 1))
+    done
+    echo "$count"
+    return 0
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local n
+    n="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    if [[ -n "$n" && "$n" =~ ^[0-9]+$ ]]; then
+      echo "$n"
+      return 0
+    fi
+  fi
+
+  "$venv_python" - <<'PY'
+import torch
+print(torch.cuda.device_count())
+PY
+}
+
+cmd__sweep_run_all() {
   load_config
   require_var OPS_REMOTE_REPO
   require_var OPS_REMOTE_OUTPUTS_DIR
@@ -1125,19 +1160,9 @@ cmd__sweep_shard() {
   require_var HF_HOME
   require_var SWEEP_CSV
 
-  local shard_index=""
-  local shard_count=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --shard-index) shard_index="$2"; shift 2 ;;
-      --shard-count) shard_count="$2"; shift 2 ;;
-      *) die "unknown arg for _sweep_shard: $1" ;;
-    esac
-  done
-
-  [[ -n "$shard_index" ]] || die "_sweep_shard requires --shard-index"
-  [[ -n "$shard_count" ]] || die "_sweep_shard requires --shard-count"
+  if [[ $# -gt 0 ]]; then
+    die "_sweep_run_all takes no arguments"
+  fi
 
   local csv
   csv="$(remote_csv_path)"
@@ -1151,6 +1176,15 @@ cmd__sweep_shard() {
   local wandb_group="${WANDB_GROUP:-}"
   if [[ -z "$wandb_group" ]]; then
     wandb_group="sweep-$(date +%Y%m%d)"
+  fi
+
+  local venv_python="$OPS_REMOTE_REPO/.venv/bin/python"
+  [[ -x "$venv_python" ]] || die "venv python not found or not executable: $venv_python (run: bash infra_scripts/workflow.sh checkout)"
+
+  local nproc_per_node
+  nproc_per_node="$(detect_visible_gpu_count "$venv_python")"
+  if [[ ! "$nproc_per_node" =~ ^[0-9]+$ || "$nproc_per_node" -le 0 ]]; then
+    die "no GPUs visible (CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES:-}'; nproc_per_node='$nproc_per_node')"
   fi
 
   local run_timeout_secs="${RUN_TIMEOUT_SECS:-0}"
@@ -1171,7 +1205,6 @@ cmd__sweep_shard() {
   fi
 
   local line
-  local row_index=0
   local started=0
   local ran=0
 
@@ -1203,12 +1236,6 @@ cmd__sweep_shard() {
         continue
       fi
     fi
-
-    if (( row_index % shard_count != shard_index )); then
-      row_index=$((row_index + 1))
-      continue
-    fi
-    row_index=$((row_index + 1))
 
     if [[ -n "${SWEEP_LIMIT:-}" && "$ran" -ge "$SWEEP_LIMIT" ]]; then
       break
@@ -1243,7 +1270,7 @@ cmd__sweep_shard() {
       die "refusing to proceed: $run_id has summary.json with ok!=true (set SWEEP_FORCE=1 to rerun)"
     fi
 
-    echo "run: $run_id (shard $shard_index/$shard_count)"
+    echo "run: $run_id (ddp nproc_per_node=$nproc_per_node)"
     cd "$OPS_REMOTE_REPO/examples/nanogpt"
 
     # Persist the exact command for reproducibility/debugging.
@@ -1252,7 +1279,10 @@ cmd__sweep_shard() {
       echo "set -euo pipefail"
       echo "cd \"$OPS_REMOTE_REPO/examples/nanogpt\""
       echo "export HF_HOME=\"$HF_HOME\""
-      echo "PYTHONUNBUFFERED=1 \"$OPS_REMOTE_REPO/.venv/bin/python\" -u train.py \"$config\" \\"
+      if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        echo "export CUDA_VISIBLE_DEVICES=\"${CUDA_VISIBLE_DEVICES}\""
+      fi
+      echo "PYTHONUNBUFFERED=1 \"$venv_python\" -m torch.distributed.run --standalone --nproc_per_node=\"$nproc_per_node\" -u train.py \"$config\" \\"
       echo "  out_dir=\"$train_out_dir\" \\"
       echo "  data_dir=\"$DATA_DIR\" \\"
       echo "  seed=\"$seed\" \\"
@@ -1260,7 +1290,7 @@ cmd__sweep_shard() {
       echo "  wandb_group=\"$wandb_group\" \\"
       echo "  wandb_run_name=\"$run_id\" \\"
       if [[ -n "${WANDB_PROJECT:-}" ]]; then
-        echo "  wandb_project=\"$WANDB_PROJECT\" \\" 
+        echo "  wandb_project=\"$WANDB_PROJECT\" \\"
       fi
       if [[ -n "${overrides:-}" ]]; then
         echo "  $overrides"
@@ -1372,7 +1402,7 @@ PY
       command -v timeout >/dev/null 2>&1 || die "timeout not found; set RUN_TIMEOUT_SECS=0 or install coreutils"
       timeout --signal=TERM --kill-after=30s "$run_timeout_secs" \
         env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-        "$OPS_REMOTE_REPO/.venv/bin/python" -u train.py "$config" \
+        "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
           out_dir="$train_out_dir" \
           data_dir="$DATA_DIR" \
           seed="$seed" \
@@ -1385,7 +1415,7 @@ PY
       rc=${PIPESTATUS[0]}
     else
       env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-        "$OPS_REMOTE_REPO/.venv/bin/python" -u train.py "$config" \
+        "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
           out_dir="$train_out_dir" \
           data_dir="$DATA_DIR" \
           seed="$seed" \
@@ -1585,7 +1615,7 @@ main() {
     sweep-start) cmd_sweep_start "$@" ;;
     sweep-status) cmd_sweep_status "$@" ;;
     fetch-run) cmd_fetch_run "$@" ;;
-    _sweep_shard) cmd__sweep_shard "$@" ;;
+    _sweep_run_all) cmd__sweep_run_all "$@" ;;
     _sweep_status) cmd__sweep_status "$@" ;;
     *)
       die "unknown command: $cmd (run: bash infra_scripts/workflow.sh help)"
