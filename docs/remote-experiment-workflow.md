@@ -120,6 +120,9 @@ bash infra_scripts/workflow.sh checkout
 
 If FineWeb shards are missing, either pre-load them under `DATA_DIR` or set `DOWNLOAD_FINEWEB=1` to download a minimal shard pair.
 
+If `DATA_DIR` is under `/mnt` and `/mnt` is mounted via s3fs, the workflow will stage the download on local disk and then copy
+completed shards into `DATA_DIR` (to avoid s3fs append/resume I/O issues during download).
+
 ### 5) Start a tmux sweep
 
 ```bash
@@ -138,7 +141,8 @@ In `local_sync` mode, `train.py` writes to `RUN_OUT_LOCAL_ROOT/<run_id>/` and th
 `${OPS_REMOTE_OUTPUTS_DIR}/<run_id>/` up to date (logs + status still live on the durable directory).
 
 What happens:
-- The sweep CSV is uploaded to the pod and copied to `${OPS_REMOTE_OUTPUTS_DIR}/_manifests/` for provenance.
+- The sweep CSV is uploaded to `${OPS_REMOTE_OUTPUTS_DIR}/_manifests/sweep-latest.csv` and timestamp-copied under `_manifests/` for provenance.
+  This avoids writing the CSV into the remote git checkout (`${OPS_REMOTE_REPO}`).
 - A tmux session `${SWEEP_TMUX_SESSION}` is created with a single `sweep` window.
 - The `sweep` window runs `infra_scripts/workflow.sh _sweep_run_all` and executes the CSV sequentially.
 - Each CSV row is launched with `torchrun` using *all visible GPUs* (respecting `CUDA_VISIBLE_DEVICES` if set).

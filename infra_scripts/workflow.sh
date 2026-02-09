@@ -194,7 +194,7 @@ Commands (local entrypoints):
   task-list                   List recent tasks
 
   sweep-csv-template         Create a starter sweep CSV at SWEEP_CSV (local)
-  workflow-sync              Upload this workflow script into the remote repo
+  workflow-sync              Deprecated (git is source of truth; no repo sync)
   sweep-start                Upload sweep CSV + start a sequential torchrun sweep in tmux
   sweep-status               Summarize sweep progress from SWEEP_CSV + outputs root
   fetch-run <run_id>         Fetch a single run directory into LOCAL_ARTIFACTS_DIR/<run_id>/
@@ -786,30 +786,11 @@ cmd_pod_butter() {
   die "failed to get a reachable pod after ${retries} attempts"
 }
 
-sync_workflow_to_remote_repo() {
-  load_config
-  require_var OPS_REMOTE_REPO
-
-  local local_sh
-  local local_env
-  local_sh="${REPO_ROOT}/infra_scripts/workflow.sh"
-  local_env="$CONFIG_PATH"
-
-  [[ -f "$local_sh" ]] || die "missing local workflow script: $local_sh"
-  [[ -f "$local_env" ]] || die "missing config file: $local_env"
-
-  remote_exec_env 'mkdir -p "$OPS_REMOTE_REPO/infra_scripts"'
-  remote_upload "$local_sh" "$OPS_REMOTE_REPO/infra_scripts/workflow.sh"
-  remote_upload "$local_env" "$OPS_REMOTE_REPO/infra_scripts/workflow.env"
-  remote_exec_env 'chmod +x "$OPS_REMOTE_REPO/infra_scripts/workflow.sh" || true'
-}
-
 cmd_workflow_sync() {
   load_config
   config_sync
   cmd_checkout
-  sync_workflow_to_remote_repo
-  log "synced workflow into remote repo: $OPS_REMOTE_REPO/infra_scripts/workflow.sh"
+  log "workflow-sync is deprecated: remote repo is updated via git checkout/pull"
 }
 
 cmd_pod_up() {
@@ -922,17 +903,43 @@ if [[ ! -d "$OPS_REMOTE_REPO/.git" ]]; then
   git clone "$REPO_URL" "$OPS_REMOTE_REPO"
 fi
 
-cd "$OPS_REMOTE_REPO"
-git fetch origin --prune
+ cd "$OPS_REMOTE_REPO"
+ git fetch origin --prune
+
+ dirty="$(git status --porcelain --untracked-files=no)"
+ if [[ -n "$dirty" ]]; then
+   if [[ "${CHECKOUT_FORCE_CLEAN:-0}" == 1 ]]; then
+     echo "warn: repo has tracked modifications; resetting (CHECKOUT_FORCE_CLEAN=1)"
+     git reset --hard HEAD
+   else
+     echo "error: repo has tracked modifications (refusing to proceed):"
+     echo "$dirty"
+     echo "set CHECKOUT_FORCE_CLEAN=1 to reset tracked files"
+     exit 4
+   fi
+ fi
 
 if [[ -n "${CHECKOUT_PR:-}" ]]; then
   git fetch origin "pull/${CHECKOUT_PR}/head:pr-${CHECKOUT_PR}"
   git checkout "pr-${CHECKOUT_PR}"
-else
-  branch="${CHECKOUT_BRANCH:-main}"
-  git checkout "$branch"
-  git pull --ff-only || true
-fi
+  else
+    branch="${CHECKOUT_BRANCH:-main}"
+    git show-ref --verify --quiet "refs/remotes/origin/$branch" || {
+      echo "error: origin/$branch not found (did you push it?)"
+      exit 6
+    }
+    git checkout -B "$branch" "origin/$branch"
+  fi
+
+ if [[ -n "${EXPECT_GIT_SHA:-}" ]]; then
+   actual="$(git rev-parse HEAD)"
+   if [[ "$actual" != "$EXPECT_GIT_SHA" ]]; then
+     echo "error: repo HEAD mismatch"
+     echo "expected: $EXPECT_GIT_SHA"
+     echo "actual:   $actual"
+     exit 5
+   fi
+ fi
 
 py="${REMOTE_PYTHON_BIN:-python3}"
 venv="$OPS_REMOTE_REPO/.venv"
@@ -1007,16 +1014,34 @@ if venv and tf.startswith(venv + os.sep):
     raise SystemExit(f"pip installed torch into venv: {tf} (not allowed)")
 PY
 
-if ls "$DATA_DIR"/fineweb_train_*.bin >/dev/null 2>&1 && ls "$DATA_DIR"/fineweb_val_*.bin >/dev/null 2>&1; then
-  echo "fineweb shards present"
-else
-  if [[ "${DOWNLOAD_FINEWEB:-0}" == 1 ]]; then
-    FINEWEB10B_LOCAL_DIR="$DATA_DIR" "$venv/bin/python" "$OPS_REMOTE_REPO/examples/nanogpt/data/fineweb10B/download.py" 1
-  else
-    echo "fineweb shards missing; set DOWNLOAD_FINEWEB=1 in config to auto-download"
-    exit 3
-  fi
-fi
+ if ls "$DATA_DIR"/fineweb_train_*.bin >/dev/null 2>&1 && ls "$DATA_DIR"/fineweb_val_*.bin >/dev/null 2>&1; then
+   echo "fineweb shards present"
+ else
+   if [[ "${DOWNLOAD_FINEWEB:-0}" == 1 ]]; then
+     download_dir="$DATA_DIR"
+     if mount | grep -q '^s3fs on /mnt '; then
+       if [[ "$DATA_DIR" == /mnt/* ]]; then
+         download_dir="/root/data/_staging_fineweb10B"
+         mkdir -p "$download_dir"
+         echo "note: DATA_DIR is on /mnt (s3fs); staging FineWeb download to $download_dir"
+       fi
+     fi
+
+     FINEWEB10B_LOCAL_DIR="$download_dir" "$venv/bin/python" "$OPS_REMOTE_REPO/examples/nanogpt/data/fineweb10B/download.py" 1
+
+     if [[ "$download_dir" != "$DATA_DIR" ]]; then
+       mkdir -p "$DATA_DIR"
+       for f in "$download_dir"/fineweb_train_*.bin "$download_dir"/fineweb_val_*.bin; do
+         [[ -f "$f" ]] || continue
+         cp -f "$f" "$DATA_DIR/$(basename "$f")"
+       done
+       echo "copied staged FineWeb shards into $DATA_DIR"
+     fi
+   else
+     echo "fineweb shards missing; set DOWNLOAD_FINEWEB=1 in config to auto-download"
+     exit 3
+   fi
+ fi
 
 target="$OPS_REMOTE_REPO/examples/nanogpt/data/fineweb10B"
 mkdir -p "$target"
@@ -1073,25 +1098,25 @@ cmd_sweep_start() {
   config_sync
   cmd_checkout
 
-  sync_workflow_to_remote_repo
-
   local csv_local
   csv_local="$(local_csv_path)"
   if [[ ! -f "$csv_local" ]]; then
     die "sweep CSV missing: $csv_local (run: bash infra_scripts/workflow.sh sweep-csv-template)"
   fi
 
-  local csv_remote
-  csv_remote="$(remote_csv_path)"
-  remote_mkdir_p "$(dirname -- "$csv_remote")"
-  remote_upload "$csv_local" "$csv_remote"
-
   require_var OPS_REMOTE_OUTPUTS_DIR
-  remote_exec_env 'ts="$(date +%Y%m%d-%H%M%S)"; mkdir -p "$OPS_REMOTE_OUTPUTS_DIR/_manifests"; if [[ "$SWEEP_CSV" = /* ]]; then csv="$SWEEP_CSV"; else csv="$OPS_REMOTE_REPO/$SWEEP_CSV"; fi; cp -f "$csv" "$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-${ts}.csv"; cp -f "$REMOTE_ENV_PATH" "$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-${ts}.env"'
+
+  # Keep the remote git checkout immutable: never write the sweep CSV into $OPS_REMOTE_REPO.
+  # Upload it to outputs manifests and run from that absolute path.
+  remote_exec_env 'mkdir -p "$OPS_REMOTE_OUTPUTS_DIR/_manifests"'
+  local csv_remote_latest
+  csv_remote_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"
+  remote_upload "$csv_local" "$csv_remote_latest"
+  remote_exec_env "ts=\"\$(date +%Y%m%d-%H%M%S)\"; cp -f \"$csv_remote_latest\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-${ts}.csv\"; cp -f \"$REMOTE_ENV_PATH\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-${ts}.env\""
 
   require_var SWEEP_TMUX_SESSION
 
-  remote_exec_env 'session="$SWEEP_TMUX_SESSION"; tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session" -n overview; tmux set-option -t "$session" remain-on-exit on; tmux list-windows -t "$session" -F "#{window_name}" | grep -qx "sweep" && tmux kill-window -t "$session":sweep 2>/dev/null || true; run_cmd="cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash infra_scripts/workflow.sh _sweep_run_all"; tmux new-window -t "$session" -n sweep "bash -lc $(printf %q "$run_cmd")"; echo "tmux attach -t $session"'
+  remote_exec_env "session=\"$SWEEP_TMUX_SESSION\"; tmux has-session -t \"$session\" 2>/dev/null || tmux new-session -d -s \"$session\" -n overview; tmux set-option -t \"$session\" remain-on-exit on; tmux list-windows -t \"$session\" -F \"#{window_name}\" | grep -qx \"sweep\" && tmux kill-window -t \"$session\":sweep 2>/dev/null || true; run_cmd=\"cd \\\"$OPS_REMOTE_REPO\\\" && WORKFLOW_CONFIG=\\\"$REMOTE_ENV_PATH\\\" bash infra_scripts/workflow.sh _sweep_run_all --csv \\\"$csv_remote_latest\\\"\"; tmux new-window -t \"$session\" -n sweep \"bash -lc $(printf %q \"$run_cmd\")\"; echo \"tmux attach -t $session\""
 }
 
 strip_quotes() {
@@ -1158,16 +1183,28 @@ cmd__sweep_run_all() {
   require_var OPS_REMOTE_OUTPUTS_DIR
   require_var DATA_DIR
   require_var HF_HOME
-  require_var SWEEP_CSV
 
   local sweep_dry_run="${SWEEP_DRY_RUN:-0}"
 
-  if [[ $# -gt 0 ]]; then
-    die "_sweep_run_all takes no arguments"
-  fi
+  local csv_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --csv) csv_arg="$2"; shift 2 ;;
+      *) die "unknown arg for _sweep_run_all: $1" ;;
+    esac
+  done
 
   local csv
-  csv="$(remote_csv_path)"
+  if [[ -n "$csv_arg" ]]; then
+    if [[ "$csv_arg" = /* ]]; then
+      csv="$csv_arg"
+    else
+      csv="$OPS_REMOTE_REPO/$csv_arg"
+    fi
+  else
+    require_var SWEEP_CSV
+    csv="$(remote_csv_path)"
+  fi
   [[ -f "$csv" ]] || die "remote sweep CSV not found: $csv"
 
   local wandb_log="False"
@@ -1516,11 +1553,30 @@ PY
 cmd__sweep_status() {
   load_config
   require_var OPS_REMOTE_OUTPUTS_DIR
-  require_var SWEEP_CSV
+
+  local csv_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --csv) csv_arg="$2"; shift 2 ;;
+      *) die "unknown arg for _sweep_status: $1" ;;
+    esac
+  done
 
   local csv
-  csv="$(remote_csv_path)"
-  [[ -f "$csv" ]] || die "remote sweep CSV not found: $csv"
+  if [[ -n "$csv_arg" ]]; then
+    csv="$csv_arg"
+  else
+    require_var SWEEP_CSV
+    csv="$(remote_csv_path)"
+  fi
+  if [[ ! -f "$csv" ]]; then
+    local latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"
+    if [[ -f "$latest" ]]; then
+      csv="$latest"
+    else
+      die "remote sweep CSV not found: $csv"
+    fi
+  fi
 
   local ok=0 failed=0 in_progress=0 missing=0 parse_error=0 total=0
   local started=0
@@ -1577,8 +1633,7 @@ cmd__sweep_status() {
 cmd_sweep_status() {
   load_config
   config_sync
-  sync_workflow_to_remote_repo
-  remote_exec_env 'cd "$OPS_REMOTE_REPO" && WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status'
+  remote_exec_env 'csv_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"; cd "$OPS_REMOTE_REPO" && if [[ -f "$csv_latest" ]]; then WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status --csv "$csv_latest"; else WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status; fi'
   remote_exec_env 'echo "attach:"; echo "tmux attach -t $SWEEP_TMUX_SESSION"; tmux ls || true'
 }
 
