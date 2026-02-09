@@ -139,8 +139,9 @@ In `local_sync` mode, `train.py` writes to `RUN_OUT_LOCAL_ROOT/<run_id>/` and th
 
 What happens:
 - The sweep CSV is uploaded to the pod and copied to `${OPS_REMOTE_OUTPUTS_DIR}/_manifests/` for provenance.
-- A tmux session `${SWEEP_TMUX_SESSION}` is created with one window per shard (`SWEEP_SHARDS`).
-- Each window runs `infra_scripts/workflow.sh _sweep_shard ...` with `CUDA_VISIBLE_DEVICES=<shard>`.
+- A tmux session `${SWEEP_TMUX_SESSION}` is created with a single `sweep` window.
+- The `sweep` window runs `infra_scripts/workflow.sh _sweep_run_all` and executes the CSV sequentially.
+- Each CSV row is launched with `torchrun` using *all visible GPUs* (respecting `CUDA_VISIBLE_DEVICES` if set).
 
 ### 6) Monitor progress
 
