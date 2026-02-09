@@ -170,6 +170,167 @@ config_sync() {
   log "synced config to ${REMOTE_ENV_PATH} on $(remote_id)"
 }
 
+fsm_state_file_hint() {
+  if [[ -n "${WF_STATE_FILE:-}" ]]; then
+    echo "$WF_STATE_FILE"
+    return 0
+  fi
+  echo "${OPS_REMOTE_OUTPUTS_DIR}/_control/workflow_state.json"
+}
+
+fsm_get_remote_state() {
+  require_var OPS_REMOTE_OUTPUTS_DIR
+  local out line state
+  state="INIT"
+  out="$(remote_exec_env 'python3 - <<'"'"'PY'"'"'
+import json
+import os
+
+path = os.environ.get("WF_STATE_FILE") or os.path.join(
+    os.environ["OPS_REMOTE_OUTPUTS_DIR"], "_control", "workflow_state.json"
+)
+state = "INIT"
+try:
+    with open(path, "r") as f:
+        state = json.load(f).get("state", "INIT")
+except Exception:
+    pass
+
+print(f"WF_STATE={state}")
+PY' || true)"
+
+  while IFS= read -r line; do
+    if [[ "$line" == WF_STATE=* ]]; then
+      state="${line#WF_STATE=}"
+    fi
+  done <<<"$out"
+
+  echo "$state"
+}
+
+fsm_set_remote_state() {
+  require_var OPS_REMOTE_OUTPUTS_DIR
+  local next_state="$1"
+  local reason="${2:-}"
+
+  remote_exec_env "WF_FSM_NEXT_STATE=$(shell_escape "$next_state") WF_FSM_REASON=$(shell_escape "$reason") python3 - <<'PY'
+import json
+import os
+import pathlib
+import socket
+import time
+
+path = os.environ.get("WF_STATE_FILE") or os.path.join(
+    os.environ["OPS_REMOTE_OUTPUTS_DIR"], "_control", "workflow_state.json"
+)
+next_state = os.environ.get("WF_FSM_NEXT_STATE", "INIT")
+reason = os.environ.get("WF_FSM_REASON", "")
+
+p = pathlib.Path(path)
+p.parent.mkdir(parents=True, exist_ok=True)
+
+previous = "INIT"
+if p.exists():
+    try:
+        previous = json.loads(p.read_text()).get("state", "INIT")
+    except Exception:
+        previous = "INIT"
+
+now = int(time.time())
+payload = {
+    "state": next_state,
+    "previous_state": previous,
+    "reason": reason,
+    "updated_at_unix": now,
+    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    "host": socket.gethostname(),
+}
+p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+print(f"WF_STATE={next_state}")
+PY" >/dev/null
+}
+
+fsm_promote_pod_ready_if_needed() {
+  if ! is_truthy "${WF_FSM_ENFORCE:-1}"; then
+    return 0
+  fi
+
+  local state
+  state="$(fsm_get_remote_state)"
+  if [[ "$state" == "INIT" ]]; then
+    fsm_set_remote_state "POD_READY" "auto-promote: remote reachable"
+  fi
+}
+
+fsm_require_state() {
+  local action="$1"
+  shift
+
+  if ! is_truthy "${WF_FSM_ENFORCE:-1}"; then
+    return 0
+  fi
+
+  local state
+  state="$(fsm_get_remote_state)"
+
+  local allowed
+  local ok=0
+  local joined=""
+  for allowed in "$@"; do
+    if [[ -z "$joined" ]]; then
+      joined="$allowed"
+    else
+      joined="$joined,$allowed"
+    fi
+
+    if [[ "$state" == "$allowed" ]]; then
+      ok=1
+    fi
+  done
+
+  if [[ "$ok" != 1 ]]; then
+    die "illegal workflow state for ${action}: current=${state} allowed=[${joined}] (hint: bash infra_scripts/workflow.sh fsm-status)"
+  fi
+}
+
+fsm_update_from_sweep_summary() {
+  local summary_text="$1"
+
+  if ! is_truthy "${WF_FSM_ENFORCE:-1}"; then
+    return 0
+  fi
+
+  local phase
+  phase="$(python3 - <<'PY' "$summary_text"
+import re
+import sys
+
+s = sys.argv[1]
+m = re.search(r"total=(\d+)\s+ok=(\d+)\s+failed=(\d+)\s+in_progress=(\d+)\s+missing_dir=(\d+)\s+parse_error=(\d+)", s)
+if not m:
+    print("unknown")
+    raise SystemExit(0)
+
+total, ok, failed, in_progress, missing_dir, parse_error = map(int, m.groups())
+if in_progress > 0:
+    print("running")
+elif total == ok + failed and missing_dir == 0 and parse_error == 0 and total > 0:
+    print("completed")
+else:
+    print("unknown")
+PY
+)"
+
+  case "$phase" in
+    running)
+      fsm_set_remote_state "SWEEP_RUNNING" "sweep-status: in progress"
+      ;;
+    completed)
+      fsm_set_remote_state "SWEEP_COMPLETED" "sweep-status: completed"
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<'EOF'
 Usage: infra_scripts/workflow.sh <command> [args]
@@ -187,6 +348,8 @@ Commands (local entrypoints):
   config-sync                Upload config to REMOTE_ENV_PATH (default /mnt/project.env)
   bootstrap                  Install prereqs (optional) + run BOOTSTRAP_SCRIPT/WANDB_SETUP_SCRIPT if present
   checkout                   Clone repo + checkout branch/PR + create venv + install deps + validate data/output dirs
+  fsm-status                 Show persisted workflow state on remote
+  fsm-reset [STATE]          Force workflow state (default: INIT)
 
   task-run                    Run a tracked remote task in tmux (state machine + logs)
   task-status                 Show task status and tail logs
@@ -229,6 +392,8 @@ cmd_task_run() {
   load_config
   config_sync
   require_var OPS_REMOTE_OUTPUTS_DIR
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "task-run" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
 
   local task_id=""
   local task_cmd=""
@@ -703,6 +868,11 @@ cmd_pod_wait() {
     # Don't spam output from lium when SSH isn't ready.
     if out="$(remote_exec_raw 'echo pod-ready' 2>&1)"; then
       log "pod is reachable"
+      if [[ -n "${OPS_REMOTE_OUTPUTS_DIR:-}" && -n "${REMOTE_ENV_PATH:-}" ]]; then
+        if config_sync >/dev/null 2>&1; then
+          fsm_set_remote_state "POD_READY" "pod-wait: reachable" || true
+        fi
+      fi
       return 0
     fi
 
@@ -733,6 +903,12 @@ cmd_pod_delete() {
 
   if [[ -z "${LIUM_TARGET:-}" ]]; then
     die "pod-delete requires LIUM_TARGET in ${CONFIG_PATH}"
+  fi
+
+  if [[ -n "${OPS_REMOTE_OUTPUTS_DIR:-}" && -n "${REMOTE_ENV_PATH:-}" ]]; then
+    if config_sync >/dev/null 2>&1; then
+      fsm_set_remote_state "INIT" "pod-delete: reset state" || true
+    fi
   fi
 
   log "deleting pod: ${LIUM_TARGET}"
@@ -799,6 +975,47 @@ cmd_workflow_sync() {
   log "workflow-sync is deprecated: remote repo is updated via git checkout/pull"
 }
 
+cmd_fsm_status() {
+  load_config
+  config_sync
+  require_var OPS_REMOTE_OUTPUTS_DIR
+
+  local state
+  state="$(fsm_get_remote_state)"
+  echo "state=$state"
+
+  remote_exec_env 'python3 - <<"PY"
+import json
+import os
+
+path = os.environ.get("WF_STATE_FILE") or os.path.join(
+    os.environ["OPS_REMOTE_OUTPUTS_DIR"], "_control", "workflow_state.json"
+)
+print(f"state_file={path}")
+if os.path.exists(path):
+    print("--- workflow_state.json ---")
+    with open(path, "r") as f:
+        print(f.read().rstrip())
+else:
+    print("state_file_missing=1")
+PY'
+}
+
+cmd_fsm_reset() {
+  load_config
+  config_sync
+  require_var OPS_REMOTE_OUTPUTS_DIR
+
+  local state="${1:-INIT}"
+  case "$state" in
+    INIT|POD_READY|BOOTSTRAPPED|CHECKED_OUT|SWEEP_RUNNING|SWEEP_COMPLETED) ;;
+    *) die "invalid state for fsm-reset: $state" ;;
+  esac
+
+  fsm_set_remote_state "$state" "manual reset"
+  echo "state=$state"
+}
+
 cmd_pod_up() {
   load_config
   command -v lium >/dev/null 2>&1 || die "lium CLI not found on PATH"
@@ -861,11 +1078,17 @@ cmd_pod_status() {
 
   config_sync
   remote_exec_raw 'echo "[remote] whoami=$(whoami)"; echo "[remote] hostname=$(hostname)"; ls -la /mnt || true'
+
+  if [[ -n "${OPS_REMOTE_OUTPUTS_DIR:-}" ]]; then
+    fsm_set_remote_state "POD_READY" "pod-status: reachable" || true
+  fi
 }
 
 cmd_bootstrap() {
   load_config
   config_sync
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "bootstrap" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_COMPLETED"
 
   remote_exec_env 'command -v tmux >/dev/null 2>&1 || echo "tmux missing"; command -v git >/dev/null 2>&1 || echo "git missing"; command -v python3 >/dev/null 2>&1 || echo "python3 missing"'
 
@@ -886,11 +1109,15 @@ cmd_bootstrap() {
       log "skip: WANDB_SETUP_SCRIPT (SWEEP_WANDB=0 and RUN_WANDB_SETUP=0)"
     fi
   fi
+
+  fsm_set_remote_state "BOOTSTRAPPED" "bootstrap complete"
 }
 
 cmd_checkout() {
   load_config
   config_sync
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "checkout" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_COMPLETED"
 
   require_var OPS_REMOTE_REPO
   require_var OPS_REMOTE_OUTPUTS_DIR
@@ -1056,6 +1283,8 @@ for f in "$DATA_DIR"/fineweb_train_*.bin "$DATA_DIR"/fineweb_val_*.bin; do
 done
 echo "linked fineweb shards into $target"
 '
+
+  fsm_set_remote_state "CHECKED_OUT" "checkout complete"
 }
 
 local_csv_path() {
@@ -1103,6 +1332,7 @@ cmd_sweep_start() {
   load_config
   config_sync
   cmd_checkout
+  fsm_require_state "sweep-start" "CHECKED_OUT" "SWEEP_COMPLETED"
 
   local csv_local
   csv_local="$(local_csv_path)"
@@ -1134,6 +1364,7 @@ echo "tmux attach -t \$session"
 EOF
 )"
   remote_exec_env "$tmux_cmd"
+  fsm_set_remote_state "SWEEP_RUNNING" "sweep-start launched"
 }
 
 strip_quotes() {
@@ -1650,13 +1881,22 @@ cmd__sweep_status() {
 cmd_sweep_status() {
   load_config
   config_sync
-  remote_exec_env 'csv_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"; cd "$OPS_REMOTE_REPO" && if [[ -f "$csv_latest" ]]; then WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status --csv "$csv_latest"; else WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status; fi'
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "sweep-status" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+
+  local status_out
+  status_out="$(remote_exec_env 'csv_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"; cd "$OPS_REMOTE_REPO" && if [[ -f "$csv_latest" ]]; then WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status --csv "$csv_latest"; else WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status; fi')"
+  printf '%s\n' "$status_out"
+  fsm_update_from_sweep_summary "$status_out"
+
   remote_exec_env 'echo "attach:"; echo "tmux attach -t $SWEEP_TMUX_SESSION"; tmux ls || true'
 }
 
 cmd_fetch_run() {
   load_config
   config_sync
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "fetch-run" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
   require_var OPS_REMOTE_OUTPUTS_DIR
   require_var LOCAL_ARTIFACTS_DIR
 
@@ -1695,6 +1935,8 @@ main() {
     task-list) cmd_task_list "$@" ;;
     sweep-csv-template) cmd_sweep_csv_template "$@" ;;
     workflow-sync) cmd_workflow_sync "$@" ;;
+    fsm-status) cmd_fsm_status "$@" ;;
+    fsm-reset) cmd_fsm_reset "$@" ;;
     sweep-start) cmd_sweep_start "$@" ;;
     sweep-status) cmd_sweep_status "$@" ;;
     fetch-run) cmd_fetch_run "$@" ;;
