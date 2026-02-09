@@ -221,3 +221,5 @@ pyrightconfig.json
 infra_scripts/project.env
 mhc_export.tgz
 wandb/
+artifacts/
+diary/
