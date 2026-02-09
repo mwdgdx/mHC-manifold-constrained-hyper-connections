@@ -1,6 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-02-06 | **Commit:** 2da037c | **Branch:** main
+This file is a living map of the repository. It intentionally does not pin a commit/branch;
+if a path referenced here does not exist, update this file.
 
 ## Overview
 
