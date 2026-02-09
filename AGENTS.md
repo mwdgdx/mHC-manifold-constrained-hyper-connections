@@ -37,15 +37,9 @@ Constraints (mHC mode):
 | nanoGPT training | `examples/nanogpt/train.py` | DDP, wandb, config loader |
 | nanoGPT model | `examples/nanogpt/model.py` | wires HC/mHC into blocks |
 | Training configs | `examples/nanogpt/config/` | baseline / hc / vres / mhc + 48-layer variants |
-| Sweep manifest | `infra_scripts/sweeps/fineweb10B_full_sweep.csv` | full FineWeb10B sweep grid + overrides |
-| Sweep runner | `infra_scripts/sweeps/run_fineweb10B_sweep.sh` | executes CSV runs to `${OPS_REMOTE_OUTPUTS_DIR}/<run_id>` |
-| Sweep config | `infra_scripts/sweeps/fineweb10B_sweep_config.sh` | hardcoded defaults for one-click sweeps |
-| Sweep launcher | `infra_scripts/sweeps/one_click_fineweb10B_sweep.sh` | bootstrap + start sharded sweep tmux session |
-| Sweep status | `infra_scripts/sweeps/sweep_status.py` | summarizes ok/failed/in-progress from summary.json |
-| Remote ops docs | `infra_scripts/remote-ops.md` | pod setup, run artifact contract, ops commands |
-| Ops blueprint | `infra_scripts/research-ops-blueprint.md` | infra design memo + future ops roadmap |
-| Infra env template | `infra_scripts/project.env.example` | env defaults for pods/sweeps (no secrets) |
-| Infra env loader | `infra_scripts/load_project_env.sh` | sources `/mnt/project.env` and other env files |
+| Remote workflow (script) | `infra_scripts/workflow.sh` | canonical entrypoint (lium-first, ssh fallback) |
+| Remote workflow (config) | `infra_scripts/workflow.env` | single config for platform/user/project knobs (no secrets) |
+| Remote workflow (docs) | `docs/remote-experiment-workflow.md` | end-to-end pod bootstrap + checkout + tmux sweeps |
 | Tests | `tests/test_hyper_connections.py` | constraints, shapes, gradients |
 
 ## Code Map (Key Symbols)

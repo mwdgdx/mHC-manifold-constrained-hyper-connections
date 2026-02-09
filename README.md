@@ -50,6 +50,13 @@ python train.py config/train_fineweb10B_cvres_mhc_48l.py
 torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc_48l.py
 ```
 
+### Remote experiments (pods / sweeps)
+
+Use the config-driven workflow:
+- Doc: `docs/remote-experiment-workflow.md`
+- Config: `infra_scripts/workflow.env`
+- Script: `infra_scripts/workflow.sh`
+
 #### Orthostochastic mHC option
 mHC supports an orthostochastic H_res projection via Newton-Schulz. Set `mhc_h_res_proj = "orthostochastic"` in your config.
 
