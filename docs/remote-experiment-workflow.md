@@ -33,6 +33,27 @@ If you already created a venv in the repo, set `VENV_RECREATE=1` once and rerun 
 - `BOOTSTRAP_SCRIPT=/mnt/bootstrap-pod.sh`
 - `WANDB_SETUP_SCRIPT=/mnt/set-wandb-api-key.sh` (should write `~/.netrc`)
 
+## Workflow FSM (First-Class)
+
+The workflow now persists a remote state file and enforces legal command transitions.
+
+- Default state file: `${OPS_REMOTE_OUTPUTS_DIR}/_control/workflow_state.json`
+- Toggle enforcement: `WF_FSM_ENFORCE=1` (default)
+- Optional override: `WF_STATE_FILE=/custom/path/workflow_state.json`
+
+Useful commands:
+
+```bash
+bash infra_scripts/workflow.sh fsm-status
+bash infra_scripts/workflow.sh fsm-reset INIT
+```
+
+Typical transition path:
+
+`INIT -> POD_READY -> BOOTSTRAPPED -> CHECKED_OUT -> SWEEP_RUNNING -> SWEEP_COMPLETED`
+
+If a command is called in an illegal state, it fails fast with a clear state/allowed-state error.
+
 ## Tracked Tasks (Jenkins-Style)
 
 For long-running remote actions that you want to observe and reliably classify as success/failure/timeout,
