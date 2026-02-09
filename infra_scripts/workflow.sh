@@ -1118,11 +1118,22 @@ cmd_sweep_start() {
   local csv_remote_latest
   csv_remote_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"
   remote_upload "$csv_local" "$csv_remote_latest"
-  remote_exec_env "ts=\"\$(date +%Y%m%d-%H%M%S)\"; cp -f \"$csv_remote_latest\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-${ts}.csv\"; cp -f \"$REMOTE_ENV_PATH\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-${ts}.env\""
+  remote_exec_env "ts=\"\$(date +%Y%m%d-%H%M%S)\"; cp -f \"$csv_remote_latest\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-\${ts}.csv\"; cp -f \"$REMOTE_ENV_PATH\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-\${ts}.env\""
 
   require_var SWEEP_TMUX_SESSION
 
-  remote_exec_env "session=\"$SWEEP_TMUX_SESSION\"; tmux has-session -t \"$session\" 2>/dev/null || tmux new-session -d -s \"$session\" -n overview; tmux set-option -t \"$session\" remain-on-exit on; tmux list-windows -t \"$session\" -F \"#{window_name}\" | grep -qx \"sweep\" && tmux kill-window -t \"$session\":sweep 2>/dev/null || true; run_cmd=\"cd \\\"$OPS_REMOTE_REPO\\\" && WORKFLOW_CONFIG=\\\"$REMOTE_ENV_PATH\\\" bash infra_scripts/workflow.sh _sweep_run_all --csv \\\"$csv_remote_latest\\\"\"; tmux new-window -t \"$session\" -n sweep \"bash -lc $(printf %q \"$run_cmd\")\"; echo \"tmux attach -t $session\""
+  local tmux_cmd
+  tmux_cmd="$(cat <<EOF
+session="\$SWEEP_TMUX_SESSION"
+tmux has-session -t "\$session" 2>/dev/null || tmux new-session -d -s "\$session" -n overview
+tmux set-option -t "\$session" remain-on-exit on
+tmux list-windows -t "\$session" -F "#{window_name}" | grep -qx "sweep" && tmux kill-window -t "\$session":sweep 2>/dev/null || true
+run_cmd="cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash infra_scripts/workflow.sh _sweep_run_all --csv \"$csv_remote_latest\""
+tmux new-window -t "\$session" -n sweep "bash -lc \$(printf %q \"\$run_cmd\")"
+echo "tmux attach -t \$session"
+EOF
+)"
+  remote_exec_env "$tmux_cmd"
 }
 
 strip_quotes() {
