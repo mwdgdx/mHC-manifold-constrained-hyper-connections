@@ -213,7 +213,11 @@ fsm_set_remote_state() {
   local next_state="$1"
   local reason="${2:-}"
 
-  remote_exec_env "WF_FSM_NEXT_STATE=$(shell_escape "$next_state") WF_FSM_REASON=$(shell_escape "$reason") python3 - <<'PY'
+  local remote_cmd
+  remote_cmd="$(cat <<EOF
+export WF_FSM_NEXT_STATE=$(shell_escape "$next_state")
+export WF_FSM_REASON=$(shell_escape "$reason")
+python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -247,7 +251,11 @@ payload = {
 }
 p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 print(f"WF_STATE={next_state}")
-PY" >/dev/null
+PY
+EOF
+)"
+
+  remote_exec_env "$remote_cmd" >/dev/null
 }
 
 fsm_promote_pod_ready_if_needed() {
