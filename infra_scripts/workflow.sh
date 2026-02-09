@@ -1284,7 +1284,7 @@ cmd__sweep_run_all() {
       if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
         echo "export CUDA_VISIBLE_DEVICES=\"${CUDA_VISIBLE_DEVICES}\""
       fi
-      echo "PYTHONUNBUFFERED=1 \"$venv_python\" -m torch.distributed.run --standalone --nproc_per_node=\"$nproc_per_node\" -u train.py \"$config\" \\"
+      echo "PYTHONUNBUFFERED=1 \"$venv_python\" -m torch.distributed.run --standalone --nproc_per_node=\"$nproc_per_node\" train.py \"$config\" \\" 
       echo "  out_dir=\"$train_out_dir\" \\"
       echo "  data_dir=\"$DATA_DIR\" \\"
       echo "  seed=\"$seed\" \\"
@@ -1412,7 +1412,7 @@ PY
         command -v timeout >/dev/null 2>&1 || die "timeout not found; set RUN_TIMEOUT_SECS=0 or install coreutils"
         timeout --signal=TERM --kill-after=30s "$run_timeout_secs" \
           env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
+          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" train.py "$config" \
             out_dir="$train_out_dir" \
             data_dir="$DATA_DIR" \
             seed="$seed" \
@@ -1425,7 +1425,7 @@ PY
         rc=${PIPESTATUS[0]}
       else
         env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
+          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" train.py "$config" \
             out_dir="$train_out_dir" \
             data_dir="$DATA_DIR" \
             seed="$seed" \
