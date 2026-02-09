@@ -1025,7 +1025,7 @@ PY
  else
    if [[ "${DOWNLOAD_FINEWEB:-0}" == 1 ]]; then
      download_dir="$DATA_DIR"
-     if mount | grep -q '^s3fs on /mnt '; then
+     if mount | grep -q "^s3fs on /mnt "; then
        if [[ "$DATA_DIR" == /mnt/* ]]; then
          download_dir="/root/data/_staging_fineweb10B"
          mkdir -p "$download_dir"
