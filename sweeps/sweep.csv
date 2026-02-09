@@ -1,0 +1,3 @@
+run_id,config,seed,overrides,notes
+example-base,config/train_fineweb10B.py,0,"max_iters=20 eval_interval=10 eval_iters=5 batch_size=8 block_size=256","example"
+example-mhc,config/train_fineweb10B_mhc.py,0,"max_iters=20 eval_interval=10 eval_iters=5 batch_size=8 block_size=256","example"
