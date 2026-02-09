@@ -1160,6 +1160,8 @@ cmd__sweep_run_all() {
   require_var HF_HOME
   require_var SWEEP_CSV
 
+  local sweep_dry_run="${SWEEP_DRY_RUN:-0}"
+
   if [[ $# -gt 0 ]]; then
     die "_sweep_run_all takes no arguments"
   fi
@@ -1309,6 +1311,7 @@ cmd__sweep_run_all() {
       echo "run_id=$run_id"
       echo "config=$config"
       echo "seed=$seed"
+      echo "dry_run=$sweep_dry_run"
       echo "timeout_secs=$run_timeout_secs"
       echo "run_out_mode=$run_out_mode"
       echo "train_out_dir=$train_out_dir"
@@ -1398,34 +1401,42 @@ PY
     set +e
     set -o pipefail
 
-    if [[ "$run_timeout_secs" != 0 ]]; then
-      command -v timeout >/dev/null 2>&1 || die "timeout not found; set RUN_TIMEOUT_SECS=0 or install coreutils"
-      timeout --signal=TERM --kill-after=30s "$run_timeout_secs" \
-        env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-        "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
-          out_dir="$train_out_dir" \
-          data_dir="$DATA_DIR" \
-          seed="$seed" \
-          wandb_log="$wandb_log" \
-          wandb_group="$wandb_group" \
-          wandb_run_name="$run_id" \
-          ${WANDB_PROJECT:+wandb_project="$WANDB_PROJECT"} \
-          $overrides \
-        2>&1 | ts_prefix | tee -a "$stdout_log"
-      rc=${PIPESTATUS[0]}
+    if is_truthy "$sweep_dry_run"; then
+      {
+        echo "== dry_run =="
+        echo "skipping train execution (SWEEP_DRY_RUN=$sweep_dry_run)"
+      } 2>&1 | ts_prefix | tee -a "$stdout_log"
+      rc=0
     else
-      env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
-        "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
-          out_dir="$train_out_dir" \
-          data_dir="$DATA_DIR" \
-          seed="$seed" \
-          wandb_log="$wandb_log" \
-          wandb_group="$wandb_group" \
-          wandb_run_name="$run_id" \
-          ${WANDB_PROJECT:+wandb_project="$WANDB_PROJECT"} \
-          $overrides \
-        2>&1 | ts_prefix | tee -a "$stdout_log"
-      rc=${PIPESTATUS[0]}
+      if [[ "$run_timeout_secs" != 0 ]]; then
+        command -v timeout >/dev/null 2>&1 || die "timeout not found; set RUN_TIMEOUT_SECS=0 or install coreutils"
+        timeout --signal=TERM --kill-after=30s "$run_timeout_secs" \
+          env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
+          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
+            out_dir="$train_out_dir" \
+            data_dir="$DATA_DIR" \
+            seed="$seed" \
+            wandb_log="$wandb_log" \
+            wandb_group="$wandb_group" \
+            wandb_run_name="$run_id" \
+            ${WANDB_PROJECT:+wandb_project="$WANDB_PROJECT"} \
+            $overrides \
+          2>&1 | ts_prefix | tee -a "$stdout_log"
+        rc=${PIPESTATUS[0]}
+      else
+        env HF_HOME="$HF_HOME" PYTHONUNBUFFERED=1 \
+          "$venv_python" -m torch.distributed.run --standalone --nproc_per_node="$nproc_per_node" -u train.py "$config" \
+            out_dir="$train_out_dir" \
+            data_dir="$DATA_DIR" \
+            seed="$seed" \
+            wandb_log="$wandb_log" \
+            wandb_group="$wandb_group" \
+            wandb_run_name="$run_id" \
+            ${WANDB_PROJECT:+wandb_project="$WANDB_PROJECT"} \
+            $overrides \
+          2>&1 | ts_prefix | tee -a "$stdout_log"
+        rc=${PIPESTATUS[0]}
+      fi
     fi
 
     set -e
