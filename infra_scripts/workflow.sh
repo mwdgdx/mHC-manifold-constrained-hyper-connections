@@ -665,7 +665,8 @@ EOF
 cmd_pod_wait() {
   load_config
 
-  local timeout_secs=300
+  local max_timeout_secs=480
+  local timeout_secs=480
   local interval_secs=15
   local show_status_every=60
 
@@ -688,6 +689,11 @@ cmd_pod_wait() {
         ;;
     esac
   done
+
+  if (( timeout_secs > max_timeout_secs )); then
+    log "clamping pod-wait timeout from ${timeout_secs}s to ${max_timeout_secs}s"
+    timeout_secs="$max_timeout_secs"
+  fi
 
   local start
   start="$(date +%s)"
