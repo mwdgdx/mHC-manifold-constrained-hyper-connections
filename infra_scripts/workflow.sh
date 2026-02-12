@@ -5,8 +5,17 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 CONFIG_PATH="${WORKFLOW_CONFIG:-${SCRIPT_DIR}/workflow.env}"
+CANONICAL_CONFIG_PATH="${SCRIPT_DIR}/workflow.env"
 
 WF_RC_SENTINEL="__WF_RC__"
+WF_HEADER_EMITTED=0
+WF_ACTIVE_COMMAND=""
+WF_ACTIVE_CONFIG_REALPATH=""
+WF_FLOW_ID=""
+WF_FLOW_RUN_DIR=""
+WF_FLOW_START_TS=""
+WF_LAST_PHASE_EVIDENCE_PATH=""
+WF_LAST_PHASE_VERDICT_PATH=""
 
 die() {
   echo "error: $*" >&2
@@ -37,12 +46,1165 @@ shell_escape() {
   printf '%q' "$1"
 }
 
+file_sha256() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return 0
+  fi
+  echo "unavailable"
+}
+
+resolved_transport_hint() {
+  if [[ -n "${LIUM_TARGET:-}" ]]; then
+    echo "lium:${LIUM_TARGET}"
+    return 0
+  fi
+  if [[ -n "${OPS_DEFAULT_HOST:-}" ]]; then
+    echo "ssh:${OPS_DEFAULT_HOST}"
+    return 0
+  fi
+  echo "unresolved"
+}
+
+emit_constitution_header_once() {
+  if [[ "${WF_HEADER_EMITTED}" == 1 ]]; then
+    return 0
+  fi
+
+  local config_sha
+  config_sha="$(file_sha256 "$CONFIG_PATH")"
+
+  local mode="canonical"
+  if [[ -n "${WF_ACTIVE_CONFIG_REALPATH:-}" && "$WF_ACTIVE_CONFIG_REALPATH" != "$CANONICAL_CONFIG_PATH" ]]; then
+    mode="override"
+  fi
+
+  local transport
+  transport="$(resolved_transport_hint)"
+
+  log "constitution version=${WF_CONSTITUTION_VERSION:-1}"
+  log "constitution active_config=${CONFIG_PATH}"
+  log "constitution active_config_sha256=${config_sha}"
+  log "constitution config_mode=${mode} override_enabled=${WF_ALLOW_OVERRIDE:-0}"
+  log "constitution command=${WF_ACTIVE_COMMAND:-unknown} transport=${transport}"
+
+  WF_HEADER_EMITTED=1
+}
+
+enforce_noninteractive_policy() {
+  local cmd="$1"
+  if ! is_truthy "${WF_REQUIRE_NONINTERACTIVE_SAFE:-1}"; then
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    return 0
+  fi
+
+  case "$cmd" in
+    pod-up|pod-butter)
+      if ! is_truthy "${LIUM_YES:-0}"; then
+        die "noninteractive safety: ${cmd} requires LIUM_YES=1 (set in ${CONFIG_PATH})"
+      fi
+      ;;
+  esac
+}
+
+constitution_preflight() {
+  local cmd="$1"
+  load_config
+
+  if [[ "${WF_CONSTITUTION_VERSION:-1}" != "1" ]]; then
+    die "unsupported WF_CONSTITUTION_VERSION=${WF_CONSTITUTION_VERSION:-unset} (expected: 1)"
+  fi
+
+  enforce_noninteractive_policy "$cmd"
+
+  case "$cmd" in
+    checkout|sweep-start|flow)
+      [[ -n "${REPO_URL:-}" ]] || die "constitutional precheck: REPO_URL is required for ${cmd} (set in ${CONFIG_PATH})"
+      ;;
+  esac
+
+  emit_constitution_header_once
+}
+
+resolve_local_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    echo "$path"
+    return 0
+  fi
+  echo "${REPO_ROOT}/${path}"
+}
+
+checklist_path() {
+  local configured="${WF_CHECKLIST_PATH:-infra_scripts/workflow.checklist.md}"
+  resolve_local_path "$configured"
+}
+
+checklist_template() {
+  cat <<'EOF'
+# Workflow Checklist (auto-generated)
+
+- [ ] P00 PRECHECK - constitutional preflight passed
+- [ ] P10 PROVISION - pod created or provisioning skipped by policy
+- [ ] P20 TARGET_BIND - LIUM target or fallback host resolved
+- [ ] P30 POD_READY - pod status and remote reachability validated
+- [ ] P40 BOOTSTRAP - prereqs/helpers completed
+- [ ] P50 CHECKOUT - repo, python env, and data contracts satisfied
+- [ ] P60 SWEEP - sweep launched or skipped by policy
+- [ ] P70 MONITOR - sweep status validation completed
+- [ ] P80 FETCH - requested artifact fetch completed or skipped
+- [ ] P90 TEARDOWN - keep/delete policy applied
+- [ ] P99 SUMMARY - final flow verdict emitted
+
+## Events
+EOF
+}
+
+checklist_reset_file() {
+  local path="$1"
+  mkdir -p "$(dirname -- "$path")"
+  checklist_template >"$path"
+}
+
+checklist_mark_done() {
+  local path="$1"
+  local phase="$2"
+  python3 - <<'PY' "$path" "$phase"
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+phase = sys.argv[2]
+
+if not path.exists():
+    raise SystemExit(f"missing checklist file: {path}")
+
+lines = path.read_text().splitlines()
+out = []
+pattern = re.compile(rf"^- \[[ x]\] {re.escape(phase)}\b")
+updated = False
+for line in lines:
+    if (not updated) and pattern.match(line):
+        out.append(pattern.sub(f"- [x] {phase}", line, count=1))
+        updated = True
+    else:
+        out.append(line)
+
+if not updated:
+    raise SystemExit(f"phase not found in checklist: {phase}")
+
+path.write_text("\n".join(out) + "\n")
+PY
+}
+
+checklist_append_event() {
+  local path="$1"
+  local phase="$2"
+  local status="$3"
+  local note="${4:-}"
+  printf -- '- %s phase=%s status=%s note=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$status" "$note" >>"$path"
+}
+
+checklist_archive_and_reset_if_needed() {
+  local path="$1"
+  if ! is_truthy "${WF_CHECKLIST_RESET_ON_END:-1}"; then
+    return 0
+  fi
+
+  cp -f "$path" "${path}.last"
+  checklist_reset_file "$path"
+  log "checklist reset: ${path} (last run snapshot: ${path}.last)"
+}
+
+flow_evidence_root() {
+  local configured="${WF_FLOW_EVIDENCE_DIR:-artifacts/pod_logs/_flows}"
+  resolve_local_path "$configured"
+}
+
+flow_init_context() {
+  local root
+  root="$(flow_evidence_root)"
+  WF_FLOW_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+  WF_FLOW_RUN_DIR="${root}/${WF_FLOW_ID}"
+  WF_FLOW_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  mkdir -p "$WF_FLOW_RUN_DIR"
+}
+
+flow_write_start_artifact() {
+  local options_desc="$1"
+  local start_path="${WF_FLOW_RUN_DIR}/flow.start.json"
+  local config_sha
+  config_sha="$(file_sha256 "$CONFIG_PATH")"
+
+  python3 - <<'PY' "$start_path" "$WF_FLOW_ID" "$WF_FLOW_START_TS" "$CONFIG_PATH" "$config_sha" "${LIUM_TARGET:-}" "${OPS_DEFAULT_HOST:-}" "$(resolved_transport_hint)" "${REMOTE_ENV_PATH:-}" "$options_desc"
+import json
+import pathlib
+import sys
+
+(
+    start_path,
+    flow_id,
+    started_at,
+    config_path,
+    config_sha,
+    lium_target,
+    fallback_host,
+    transport,
+    remote_env,
+    options_desc,
+) = sys.argv[1:]
+
+payload = {
+    "flow_id": flow_id,
+    "started_at": started_at,
+    "active_config_path": config_path,
+    "active_config_sha256": config_sha,
+    "lium_target": lium_target,
+    "ops_default_host": fallback_host,
+    "transport_hint": transport,
+    "remote_env_path": remote_env,
+    "options": options_desc,
+}
+pathlib.Path(start_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+flow_write_summary_artifact() {
+  local rc="$1"
+  local failed_phase="$2"
+  local checklist_file="$3"
+  local summary_path="${WF_FLOW_RUN_DIR}/flow.summary.json"
+  local ended_at
+  ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  python3 - <<'PY' "$summary_path" "$WF_FLOW_ID" "$WF_FLOW_START_TS" "$ended_at" "$rc" "$failed_phase" "$checklist_file"
+import json
+import pathlib
+import sys
+
+summary_path, flow_id, started_at, ended_at, rc, failed_phase, checklist_file = sys.argv[1:]
+payload = {
+    "flow_id": flow_id,
+    "started_at": started_at,
+    "ended_at": ended_at,
+    "ok": rc == "0",
+    "exit_code": int(rc),
+    "failed_phase": failed_phase,
+    "checklist_file": checklist_file,
+}
+pathlib.Path(summary_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+phase_has_contract() {
+  local phase="$1"
+  case "$phase" in
+    P00|P10|P20|P30|P40|P50|P60|P70|P80|P90|P99) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+phase_command_allowed() {
+  local phase="$1"
+  local command_name="$2"
+  case "$phase" in
+    P00) [[ "$command_name" == "flow-precheck" ]] ;;
+    P10) [[ "$command_name" == "pod-up" || "$command_name" == "provision-policy" ]] ;;
+    P20) [[ "$command_name" == "target-bind" ]] ;;
+    P30) [[ "$command_name" == "pod-status" ]] ;;
+    P40) [[ "$command_name" == "bootstrap" ]] ;;
+    P50) [[ "$command_name" == "checkout" ]] ;;
+    P60) [[ "$command_name" == "sweep-start" || "$command_name" == "sweep-status" || "$command_name" == "sweep-policy" ]] ;;
+    P70) [[ "$command_name" == "sweep-wait" || "$command_name" == "sweep-status" ]] ;;
+    P80) [[ "$command_name" == "fetch-policy" || "$command_name" == "fetch-all" || "$command_name" == "fetch-run" ]] ;;
+    P90) [[ "$command_name" == "teardown-policy" || "$command_name" == "pod-delete" ]] ;;
+    P99) [[ "$command_name" == "flow-summary" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+phase_default_command() {
+  local phase="$1"
+  case "$phase" in
+    P00) printf '%s\n' "flow-precheck" ;;
+    P10) printf '%s\n' "provision-policy" ;;
+    P20) printf '%s\n' "target-bind" ;;
+    P30) printf '%s\n' "pod-status" ;;
+    P40) printf '%s\n' "bootstrap" ;;
+    P50) printf '%s\n' "checkout" ;;
+    P60) printf '%s\n' "sweep-policy" ;;
+    P70) printf '%s\n' "sweep-status" ;;
+    P80) printf '%s\n' "fetch-policy" ;;
+    P90) printf '%s\n' "teardown-policy" ;;
+    P99) printf '%s\n' "flow-summary" ;;
+    *) printf '%s\n' "flow" ;;
+  esac
+}
+
+run_subagent_validator() {
+  local evidence_path="$1"
+  local output_path="$2"
+  local phase="$3"
+  local cmd_raw="${WF_SUBAGENT_VALIDATOR_CMD:-python3 infra_scripts/workflow_phase_court.py}"
+
+  local -a cmd_parts
+  read -r -a cmd_parts <<<"$cmd_raw"
+  [[ "${#cmd_parts[@]}" -gt 0 ]] || return 2
+
+  if [[ "${cmd_parts[0]}" == "python3" && "${cmd_parts[1]:-}" == "infra_scripts/workflow_phase_court.py" ]]; then
+    cmd_parts[1]="${SCRIPT_DIR}/workflow_phase_court.py"
+  fi
+
+  local timeout_secs="${WF_SUBAGENT_VALIDATOR_TIMEOUT_SECS:-120}"
+  [[ "$timeout_secs" =~ ^[0-9]+$ ]] || timeout_secs=120
+
+  if command -v timeout >/dev/null 2>&1 && (( timeout_secs > 0 )); then
+    timeout "$timeout_secs" "${cmd_parts[@]}" --evidence "$evidence_path" --output "$output_path" --phase "$phase"
+    return $?
+  fi
+
+  "${cmd_parts[@]}" --evidence "$evidence_path" --output "$output_path" --phase "$phase"
+}
+
+write_constitutional_fallback() {
+  local output_path="$1"
+  local phase="$2"
+  local status="$3"
+  local reason="$4"
+  python3 - <<'PY' "$output_path" "$phase" "$status" "$reason"
+import json
+import pathlib
+import sys
+
+output_path, phase, status, reason = sys.argv[1:]
+payload = {
+    "phase": phase,
+    "status": status,
+    "pass": status == "pass",
+    "violations": [] if status == "pass" else [reason],
+    "remediation": "configure WF_SUBAGENT_VALIDATOR_CMD and rerun flow",
+}
+pathlib.Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+flow_phase_court() {
+  local phase="$1"
+  local phase_status="$2"
+  local note="$3"
+  local command_name="$4"
+  local command_rc="$5"
+  local fsm_before="${6:-UNAVAILABLE}"
+  local fsm_after="${7:-UNAVAILABLE}"
+
+  local evidence_path="${WF_FLOW_RUN_DIR}/phase.${phase}.evidence.json"
+  local det_path="${WF_FLOW_RUN_DIR}/phase.${phase}.deterministic.json"
+  local constitutional_path="${WF_FLOW_RUN_DIR}/phase.${phase}.constitutional.json"
+  local verdict_path="${WF_FLOW_RUN_DIR}/phase.${phase}.verdict.json"
+  local phase_started
+  phase_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local phase_ended
+  phase_ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local effective_teardown="${WF_FLOW_TEARDOWN_MODE:-${WF_DEFAULT_TEARDOWN:-keep}}"
+
+  python3 - <<'PY' "$evidence_path" "$WF_FLOW_ID" "$phase" "$phase_started" "$phase_ended" "$CONFIG_PATH" "$(file_sha256 "$CONFIG_PATH")" "${LIUM_TARGET:-}" "${OPS_DEFAULT_HOST:-}" "$(resolved_transport_hint)" "${REMOTE_ENV_PATH:-}" "$command_name" "$command_rc" "$phase_status" "$note" "$fsm_before" "$fsm_after" "${REPO_URL:-}" "$effective_teardown" "${WF_FLOW_RUN_DIR}/flow.start.json"
+import json
+import pathlib
+import sys
+
+(
+    evidence_path,
+    flow_id,
+    phase,
+    phase_started,
+    phase_ended,
+    config_path,
+    config_sha,
+    lium_target,
+    fallback_host,
+    transport,
+    remote_env,
+    command_name,
+    command_rc,
+    phase_status,
+    note,
+    fsm_before,
+    fsm_after,
+    repo_url,
+    teardown_mode,
+    flow_start_artifact,
+) = sys.argv[1:]
+
+phase_contracts = {
+    "P00": {
+        "intent": "Precheck constitutional prerequisites before any remote mutation.",
+        "laws": ["LAW_1_CANONICAL_CONFIG", "LAW_2_SINGLE_CANONICAL_LIFECYCLE", "LAW_4_NONINTERACTIVE_SAFETY", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["flow-precheck"],
+    },
+    "P10": {
+        "intent": "Provision pod deterministically or explicitly mark policy skip.",
+        "laws": ["LAW_3_TARGET_RESOLUTION", "LAW_4_NONINTERACTIVE_SAFETY", "LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["pod-up", "provision-policy"],
+    },
+    "P20": {
+        "intent": "Resolve and lock a legal execution target for remaining phases.",
+        "laws": ["LAW_3_TARGET_RESOLUTION", "LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["target-bind"],
+    },
+    "P30": {
+        "intent": "Prove remote target is reachable and pod is ready.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["pod-status"],
+    },
+    "P40": {
+        "intent": "Satisfy bootstrap prerequisites and helper initialization policy.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["bootstrap"],
+    },
+    "P50": {
+        "intent": "Checkout repository and validate torch/data contracts for training readiness.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_8_DOC_SCRIPT_CONSISTENCY", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["checkout"],
+    },
+    "P60": {
+        "intent": "Start, resume-check, or policy-skip sweep in a declared mode.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["sweep-start", "sweep-status", "sweep-policy"],
+    },
+    "P70": {
+        "intent": "Monitor sweep completion state via wait or snapshot path.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["sweep-wait", "sweep-status"],
+    },
+    "P80": {
+        "intent": "Fetch artifacts according to explicit fetch policy.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["fetch-policy", "fetch-all", "fetch-run"],
+    },
+    "P90": {
+        "intent": "Apply explicit teardown policy without implicit destruction.",
+        "laws": ["LAW_7_EXPLICIT_DESTRUCTION", "LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["teardown-policy", "pod-delete"],
+    },
+    "P99": {
+        "intent": "Emit final constitutional summary only after all prior phases are known.",
+        "laws": ["LAW_5_PHASE_CONTRACT", "LAW_6_PROVENANCE", "LAW_9_PHASE_END_CONSTITUTIONAL_VALIDATION"],
+        "commands": ["flow-summary"],
+    },
+}
+
+contract = phase_contracts.get(phase, {"intent": "", "laws": [], "commands": []})
+
+payload = {
+    "flow_id": flow_id,
+    "phase_id": phase,
+    "started_at": phase_started,
+    "ended_at": phase_ended,
+    "active_config_path": config_path,
+    "active_config_sha256": config_sha,
+    "lium_target": lium_target,
+    "ops_default_host": fallback_host,
+    "transport_hint": transport,
+    "remote_env_path": remote_env,
+    "command_name": command_name,
+    "command_rc": int(command_rc),
+    "phase_status": phase_status,
+    "note": note,
+    "fsm_before": fsm_before,
+    "fsm_after": fsm_after,
+    "repo_url": repo_url,
+    "teardown_mode": teardown_mode,
+    "command_transcript_path": "",
+    "intent_mode": "mandated_contract_or_die",
+    "contract_intent": contract["intent"],
+    "applicable_laws": contract["laws"],
+    "allowed_commands": contract["commands"],
+    "flow_start_artifact": flow_start_artifact,
+    "command_in_contract": command_name in set(contract["commands"]),
+}
+pathlib.Path(evidence_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+
+  local -a det_violations=()
+  local det_pass=1
+  if [[ "$phase_status" != "ok" ]]; then
+    det_pass=0
+    det_violations+=("phase_status_not_ok")
+  fi
+  if [[ "$command_rc" != "0" ]]; then
+    det_pass=0
+    det_violations+=("command_rc_non_zero")
+  fi
+  case "$phase" in
+    P20)
+      if [[ -z "${LIUM_TARGET:-}" && -z "${OPS_DEFAULT_HOST:-}" ]]; then
+        det_pass=0
+        det_violations+=("target_not_resolved")
+      fi
+      ;;
+    P50|P60)
+      if [[ -z "${REPO_URL:-}" ]]; then
+        det_pass=0
+        det_violations+=("repo_url_missing")
+      fi
+      ;;
+    P90)
+      case "$effective_teardown" in
+        keep|delete) ;;
+        *)
+          det_pass=0
+          det_violations+=("invalid_teardown_policy")
+          ;;
+      esac
+      ;;
+    P00|P10|P30|P40|P70|P80|P99)
+      ;;
+    *)
+      det_pass=0
+      det_violations+=("unknown_phase_contract")
+      ;;
+  esac
+  if ! phase_has_contract "$phase"; then
+    det_pass=0
+    det_violations+=("unknown_phase_contract")
+  fi
+  if ! phase_command_allowed "$phase" "$command_name"; then
+    det_pass=0
+    det_violations+=("intent_command_mismatch")
+  fi
+
+  python3 - <<'PY' "$det_path" "$phase" "$det_pass" "${det_violations[@]-}"
+import json
+import pathlib
+import sys
+
+det_path = sys.argv[1]
+phase = sys.argv[2]
+det_pass = sys.argv[3] == "1"
+violations = sys.argv[4:]
+
+payload = {
+    "phase": phase,
+    "status": "pass" if det_pass else "fail",
+    "pass": det_pass,
+    "violations": violations,
+}
+pathlib.Path(det_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+
+  local constitutional_state="unverified"
+  local constitutional_pass=0
+  if ! is_truthy "${WF_PHASE_COURT_ENFORCE:-1}"; then
+    constitutional_state="pass"
+    constitutional_pass=1
+    write_constitutional_fallback "$constitutional_path" "$phase" "pass" "court_disabled"
+  else
+    if run_subagent_validator "$evidence_path" "$constitutional_path" "$phase"; then
+      constitutional_state="$(python3 - <<'PY' "$constitutional_path"
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    print("unverified")
+    raise SystemExit(0)
+
+status = str(data.get("status", "unverified"))
+print(status)
+PY
+)"
+      if [[ "$constitutional_state" == "pass" ]]; then
+        constitutional_pass=1
+      fi
+    else
+      constitutional_state="unverified"
+      write_constitutional_fallback "$constitutional_path" "$phase" "unverified" "subagent_validator_failed"
+    fi
+  fi
+
+  local court_pass=0
+  if [[ "$det_pass" == "1" && "$constitutional_pass" == "1" ]]; then
+    court_pass=1
+  fi
+
+  python3 - <<'PY' "$verdict_path" "$phase" "$court_pass" "$det_pass" "$constitutional_state" "$evidence_path" "$det_path" "$constitutional_path"
+import json
+import pathlib
+import sys
+
+(
+    verdict_path,
+    phase,
+    court_pass,
+    det_pass,
+    constitutional_state,
+    evidence_path,
+    det_path,
+    constitutional_path,
+) = sys.argv[1:]
+
+payload = {
+    "phase": phase,
+    "court": "pass" if court_pass == "1" else "fail",
+    "deterministic": "pass" if det_pass == "1" else "fail",
+    "constitutional": constitutional_state,
+    "phase_pass": court_pass == "1",
+    "evidence": evidence_path,
+    "deterministic_artifact": det_path,
+    "constitutional_artifact": constitutional_path,
+}
+pathlib.Path(verdict_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+
+  WF_LAST_PHASE_EVIDENCE_PATH="$evidence_path"
+  WF_LAST_PHASE_VERDICT_PATH="$verdict_path"
+
+  local det_label="fail"
+  [[ "$det_pass" == "1" ]] && det_label="pass"
+  local court_label="fail"
+  [[ "$court_pass" == "1" ]] && court_label="pass"
+
+  log "PHASE=${phase} COURT=${court_label} DET=${det_label} CONST=${constitutional_state} VERDICT=${verdict_path}"
+  [[ "$court_pass" == "1" ]]
+}
+
+flow_finalize_phase() {
+  local checklist_file="$1"
+  local phase="$2"
+  local note="$3"
+  local command_name="$4"
+  local command_rc="$5"
+  local fsm_before="${6:-UNAVAILABLE}"
+  local fsm_after="${7:-UNAVAILABLE}"
+
+  if ! flow_phase_court "$phase" "ok" "$note" "$command_name" "$command_rc" "$fsm_before" "$fsm_after"; then
+    checklist_append_event "$checklist_file" "$phase" "court_failed" "$note"
+    return 1
+  fi
+
+  checklist_mark_done "$checklist_file" "$phase"
+  checklist_append_event "$checklist_file" "$phase" "ok" "$note"
+  log "PHASE=${phase} STATUS=ok CODE=0 ARTIFACT=${WF_LAST_PHASE_EVIDENCE_PATH}"
+  return 0
+}
+
+flow_record_phase_failure() {
+  local checklist_file="$1"
+  local phase="$2"
+  local note="$3"
+  local command_name="$4"
+  local command_rc="$5"
+  local fsm_before="${6:-UNAVAILABLE}"
+  local fsm_after="${7:-UNAVAILABLE}"
+
+  if ! flow_phase_court "$phase" "fail" "$note" "$command_name" "$command_rc" "$fsm_before" "$fsm_after"; then
+    true
+  fi
+  checklist_append_event "$checklist_file" "$phase" "failed" "$note"
+  log "PHASE=${phase} STATUS=fail CODE=${command_rc} ARTIFACT=${WF_LAST_PHASE_EVIDENCE_PATH}"
+}
+
+upsert_config_value() {
+  local file_path="$1"
+  local key="$2"
+  local value="$3"
+
+  python3 - <<'PY' "$file_path" "$key" "$value"
+import pathlib
+import re
+import sys
+
+file_path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+path = pathlib.Path(file_path)
+if not path.exists():
+    raise SystemExit(f"config file does not exist: {file_path}")
+
+raw = path.read_text().splitlines()
+escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+newline = f'{key}="{escaped}"'
+pattern = re.compile(rf'^\s*{re.escape(key)}=')
+
+updated = False
+out = []
+for line in raw:
+    if not updated and pattern.match(line):
+        out.append(newline)
+        updated = True
+    else:
+        out.append(line)
+
+if not updated:
+    if out and out[-1] != "":
+        out.append("")
+    out.append(newline)
+
+path.write_text("\n".join(out) + "\n")
+PY
+}
+
+flow_wait_for_completion() {
+  local interval_secs="${WF_FLOW_WAIT_INTERVAL_SECS:-30}"
+  local max_polls="${WF_FLOW_WAIT_MAX_POLLS:-240}"
+  local polls=0
+
+  [[ "$interval_secs" =~ ^[0-9]+$ ]] || die "WF_FLOW_WAIT_INTERVAL_SECS must be an integer"
+  [[ "$max_polls" =~ ^[0-9]+$ ]] || die "WF_FLOW_WAIT_MAX_POLLS must be an integer"
+
+  while true; do
+    local status_out
+    status_out="$(run_workflow_subcommand sweep-status)"
+    printf '%s\n' "$status_out"
+
+    local phase
+    phase="$(python3 - <<'PY' "$status_out"
+import re
+import sys
+
+s = sys.argv[1]
+m = re.search(r"total=(\d+)\s+ok=(\d+)\s+failed=(\d+)\s+in_progress=(\d+)\s+missing_dir=(\d+)\s+parse_error=(\d+)", s)
+if not m:
+    print("unknown")
+    raise SystemExit(0)
+
+total, ok, failed, in_progress, missing_dir, parse_error = map(int, m.groups())
+if in_progress > 0:
+    print("running")
+elif total > 0 and total == ok + failed and missing_dir == 0 and parse_error == 0:
+    print("completed")
+else:
+    print("unknown")
+PY
+)"
+
+    case "$phase" in
+      completed)
+        return 0
+        ;;
+      running)
+        ;;
+      *)
+        die "flow wait: sweep status is not converging (phase=${phase})"
+        ;;
+    esac
+
+    polls=$((polls + 1))
+    if (( max_polls > 0 && polls >= max_polls )); then
+      die "flow wait: exceeded max polls (${max_polls})"
+    fi
+    sleep "$interval_secs"
+  done
+}
+
+flow_fetch_all_runs() {
+  local csv
+  csv="$(local_csv_path)"
+  [[ -f "$csv" ]] || die "flow fetch=all requires sweep CSV: $csv"
+
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    run_workflow_subcommand fetch-run "$run_id"
+  done < <(python3 - <<'PY' "$csv"
+import csv
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("r", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+      run_id = (row.get("run_id") or "").strip()
+      if run_id:
+          print(run_id)
+PY
+)
+}
+
+run_workflow_subcommand() {
+  local subcmd="$1"
+  shift || true
+  WORKFLOW_CONFIG="$CONFIG_PATH" bash "${SCRIPT_DIR}/workflow.sh" "$subcmd" "$@"
+}
+
+cmd_checklist_reset() {
+  load_config
+  local path
+  path="$(checklist_path)"
+  checklist_reset_file "$path"
+  log "checklist reset: $path"
+}
+
+cmd_checklist_status() {
+  load_config
+  local path
+  path="$(checklist_path)"
+
+  if [[ ! -f "$path" ]]; then
+    checklist_reset_file "$path"
+  fi
+  sed -n '1,200p' "$path"
+}
+
+cmd_flow() {
+  load_config
+
+  local provision_mode="auto"
+  local sweep_mode="start"
+  local wait_mode="false"
+  local fetch_mode="none"
+  local teardown_mode="${WF_DEFAULT_TEARDOWN:-keep}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provision)
+        provision_mode="$2"
+        shift 2
+        ;;
+      --provision=*)
+        provision_mode="${1#*=}"
+        shift
+        ;;
+      --sweep)
+        sweep_mode="$2"
+        shift 2
+        ;;
+      --sweep=*)
+        sweep_mode="${1#*=}"
+        shift
+        ;;
+      --wait)
+        wait_mode="$2"
+        shift 2
+        ;;
+      --wait=*)
+        wait_mode="${1#*=}"
+        shift
+        ;;
+      --fetch)
+        fetch_mode="$2"
+        shift 2
+        ;;
+      --fetch=*)
+        fetch_mode="${1#*=}"
+        shift
+        ;;
+      --teardown)
+        teardown_mode="$2"
+        shift 2
+        ;;
+      --teardown=*)
+        teardown_mode="${1#*=}"
+        shift
+        ;;
+      *)
+        die "unknown arg for flow: $1"
+        ;;
+    esac
+  done
+
+  case "$provision_mode" in
+    auto|skip) ;;
+    *) die "flow --provision must be one of: auto, skip" ;;
+  esac
+  case "$sweep_mode" in
+    start|resume|skip) ;;
+    *) die "flow --sweep must be one of: start, resume, skip" ;;
+  esac
+  case "$wait_mode" in
+    true|false) ;;
+    *) die "flow --wait must be true or false" ;;
+  esac
+  case "$teardown_mode" in
+    keep|delete) ;;
+    *) die "flow --teardown must be keep or delete" ;;
+  esac
+  case "$fetch_mode" in
+    none|all|run:*) ;;
+    *) die "flow --fetch must be none, all, or run:<run_id>" ;;
+  esac
+
+  WF_FLOW_TEARDOWN_MODE="$teardown_mode"
+
+  local checklist_file
+  checklist_file="$(checklist_path)"
+  checklist_reset_file "$checklist_file"
+  checklist_append_event "$checklist_file" "FLOW" "start" "provision=${provision_mode} sweep=${sweep_mode} wait=${wait_mode} fetch=${fetch_mode} teardown=${teardown_mode}"
+
+  flow_init_context
+  flow_write_start_artifact "provision=${provision_mode} sweep=${sweep_mode} wait=${wait_mode} fetch=${fetch_mode} teardown=${teardown_mode}"
+
+  local rc=0
+  local failed_phase=""
+
+  if ! flow_finalize_phase "$checklist_file" "P00" "constitutional preflight complete" "flow-precheck" "0"; then
+    rc=1
+    failed_phase="P00"
+  fi
+
+  if [[ "$provision_mode" == "auto" ]]; then
+    if [[ "$rc" -eq 0 && -z "${LIUM_TARGET:-}" ]]; then
+      if [[ ! -t 0 && ! -t 1 ]] && ! is_truthy "${LIUM_YES:-0}"; then
+        rc=1
+        failed_phase="P10"
+        flow_record_phase_failure "$checklist_file" "P10" "noninteractive safety violation" "pod-up" "$rc"
+      elif ! run_workflow_subcommand pod-up; then
+        rc=$?
+        failed_phase="P10"
+        flow_record_phase_failure "$checklist_file" "P10" "pod-up failed" "pod-up" "$rc"
+      fi
+
+      if [[ "$rc" -eq 0 && -z "${LIUM_TARGET:-}" ]]; then
+        if [[ -n "${LIUM_POD_NAME:-}" ]]; then
+          upsert_config_value "$CONFIG_PATH" "LIUM_TARGET" "$LIUM_POD_NAME"
+          log "flow target autobind: set LIUM_TARGET=${LIUM_POD_NAME} in ${CONFIG_PATH}"
+          load_config
+        else
+          rc=1
+          failed_phase="P10"
+          flow_record_phase_failure "$checklist_file" "P10" "unable to autobind LIUM_TARGET from LIUM_POD_NAME" "target-autobind" "$rc"
+        fi
+      fi
+    fi
+
+    if [[ "$rc" -eq 0 ]]; then
+      if ! flow_finalize_phase "$checklist_file" "P10" "pod provisioning complete" "pod-up" "0"; then
+        rc=1
+        failed_phase="P10"
+      fi
+    fi
+  else
+    if ! flow_finalize_phase "$checklist_file" "P10" "provision skipped by policy" "provision-policy" "0"; then
+      rc=1
+      failed_phase="P10"
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ -z "${LIUM_TARGET:-}" && -z "${OPS_DEFAULT_HOST:-}" ]]; then
+      rc=1
+      failed_phase="P20"
+      flow_record_phase_failure "$checklist_file" "P20" "no LIUM target or fallback host resolved" "target-bind" "$rc"
+    else
+      if ! flow_finalize_phase "$checklist_file" "P20" "target resolved" "target-bind" "0"; then
+        rc=1
+        failed_phase="P20"
+      fi
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if run_workflow_subcommand pod-status; then
+      if ! flow_finalize_phase "$checklist_file" "P30" "pod status validated" "pod-status" "0"; then
+        rc=1
+        failed_phase="P30"
+      fi
+    else
+      rc=$?
+      failed_phase="P30"
+      flow_record_phase_failure "$checklist_file" "P30" "pod-status failed" "pod-status" "$rc"
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if run_workflow_subcommand bootstrap; then
+      if ! flow_finalize_phase "$checklist_file" "P40" "bootstrap complete" "bootstrap" "0"; then
+        rc=1
+        failed_phase="P40"
+      fi
+    else
+      rc=$?
+      failed_phase="P40"
+      flow_record_phase_failure "$checklist_file" "P40" "bootstrap failed" "bootstrap" "$rc"
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if run_workflow_subcommand checkout; then
+      if ! flow_finalize_phase "$checklist_file" "P50" "checkout complete" "checkout" "0"; then
+        rc=1
+        failed_phase="P50"
+      fi
+    else
+      rc=$?
+      failed_phase="P50"
+      flow_record_phase_failure "$checklist_file" "P50" "checkout failed" "checkout" "$rc"
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$sweep_mode" == "start" ]]; then
+      if run_workflow_subcommand sweep-start; then
+        if ! flow_finalize_phase "$checklist_file" "P60" "sweep start complete" "sweep-start" "0"; then
+          rc=1
+          failed_phase="P60"
+        fi
+      else
+        rc=$?
+        failed_phase="P60"
+        flow_record_phase_failure "$checklist_file" "P60" "sweep-start failed" "sweep-start" "$rc"
+      fi
+    elif [[ "$sweep_mode" == "resume" ]]; then
+      if run_workflow_subcommand sweep-status; then
+        if ! flow_finalize_phase "$checklist_file" "P60" "sweep resume acknowledged" "sweep-status" "0"; then
+          rc=1
+          failed_phase="P60"
+        fi
+      else
+        rc=$?
+        failed_phase="P60"
+        flow_record_phase_failure "$checklist_file" "P60" "sweep resume status check failed" "sweep-status" "$rc"
+      fi
+    else
+      if ! flow_finalize_phase "$checklist_file" "P60" "sweep skipped by policy" "sweep-policy" "0"; then
+        rc=1
+        failed_phase="P60"
+      fi
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$wait_mode" == "true" ]]; then
+      if flow_wait_for_completion; then
+        if ! flow_finalize_phase "$checklist_file" "P70" "waited for sweep completion" "sweep-wait" "0"; then
+          rc=1
+          failed_phase="P70"
+        fi
+      else
+        rc=$?
+        failed_phase="P70"
+        flow_record_phase_failure "$checklist_file" "P70" "sweep wait failed" "sweep-wait" "$rc"
+      fi
+    else
+      if run_workflow_subcommand sweep-status; then
+        if ! flow_finalize_phase "$checklist_file" "P70" "monitor snapshot complete" "sweep-status" "0"; then
+          rc=1
+          failed_phase="P70"
+        fi
+      else
+        rc=$?
+        failed_phase="P70"
+        flow_record_phase_failure "$checklist_file" "P70" "sweep-status failed" "sweep-status" "$rc"
+      fi
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    case "$fetch_mode" in
+      none)
+        if ! flow_finalize_phase "$checklist_file" "P80" "fetch skipped by policy" "fetch-policy" "0"; then
+          rc=1
+          failed_phase="P80"
+        fi
+        ;;
+      all)
+        if flow_fetch_all_runs; then
+          if ! flow_finalize_phase "$checklist_file" "P80" "fetched all run artifacts" "fetch-all" "0"; then
+            rc=1
+            failed_phase="P80"
+          fi
+        else
+          rc=$?
+          failed_phase="P80"
+          flow_record_phase_failure "$checklist_file" "P80" "fetch-all failed" "fetch-all" "$rc"
+        fi
+        ;;
+      run:*)
+        local run_id="${fetch_mode#run:}"
+        if [[ -z "$run_id" ]]; then
+          rc=1
+          failed_phase="P80"
+          flow_record_phase_failure "$checklist_file" "P80" "empty run id in --fetch run:<id>" "fetch-run" "$rc"
+        elif run_workflow_subcommand fetch-run "$run_id"; then
+          if ! flow_finalize_phase "$checklist_file" "P80" "fetched run=${run_id}" "fetch-run" "0"; then
+            rc=1
+            failed_phase="P80"
+          fi
+        else
+          rc=$?
+          failed_phase="P80"
+          flow_record_phase_failure "$checklist_file" "P80" "fetch-run failed for ${run_id}" "fetch-run" "$rc"
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    case "$teardown_mode" in
+      keep)
+        if ! flow_finalize_phase "$checklist_file" "P90" "teardown=keep" "teardown-policy" "0"; then
+          rc=1
+          failed_phase="P90"
+        fi
+        ;;
+      delete)
+        if run_workflow_subcommand pod-delete; then
+          if ! flow_finalize_phase "$checklist_file" "P90" "teardown=delete" "pod-delete" "0"; then
+            rc=1
+            failed_phase="P90"
+          fi
+        else
+          rc=$?
+          failed_phase="P90"
+          flow_record_phase_failure "$checklist_file" "P90" "pod-delete failed" "pod-delete" "$rc"
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if flow_finalize_phase "$checklist_file" "P99" "flow success" "flow-summary" "0"; then
+      :
+    else
+      rc=1
+      failed_phase="P99"
+      log "flow failed at phase ${failed_phase} due to constitutional court"
+    fi
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+  flow_record_phase_failure "$checklist_file" "${failed_phase:-UNKNOWN}" "flow halted" "$(phase_default_command "${failed_phase:-UNKNOWN}")" "$rc"
+    log "flow failed at phase ${failed_phase:-UNKNOWN} (rc=${rc})"
+  fi
+
+  flow_write_summary_artifact "$rc" "$failed_phase" "$checklist_file"
+
+  if [[ "$rc" -eq 0 ]]; then
+    log "flow completed successfully"
+  fi
+
+  checklist_archive_and_reset_if_needed "$checklist_file"
+  return "$rc"
+}
+
 load_config() {
   if [[ ! -f "$CONFIG_PATH" ]]; then
     die "config file not found: ${CONFIG_PATH}"
   fi
+  local resolved_config="$CONFIG_PATH"
+  if [[ "$resolved_config" != /* ]]; then
+    resolved_config="$(cd -- "$(dirname -- "$resolved_config")" && pwd)/$(basename -- "$resolved_config")"
+  fi
+  WF_ACTIVE_CONFIG_REALPATH="$resolved_config"
+
   # shellcheck disable=SC1090
   source "$CONFIG_PATH"
+
+  if [[ "${WF_ACTIVE_COMMAND:-}" != _* && "$WF_ACTIVE_CONFIG_REALPATH" != "$CANONICAL_CONFIG_PATH" ]]; then
+    if ! is_truthy "${WF_ALLOW_OVERRIDE:-0}"; then
+      die "WORKFLOW_CONFIG override blocked by constitution; use ${CANONICAL_CONFIG_PATH} or set WF_ALLOW_OVERRIDE=1 in ${CONFIG_PATH}"
+    fi
+  fi
 }
 
 remote_id() {
@@ -344,10 +1506,14 @@ cmd_help() {
 Usage: infra_scripts/workflow.sh <command> [args]
 
 Config:
-  - Default: infra_scripts/workflow.env
-  - Override: WORKFLOW_CONFIG=/path/to/file
+  - Canonical: infra_scripts/workflow.env
+  - Override: WORKFLOW_CONFIG=/path/to/file (blocked unless WF_ALLOW_OVERRIDE=1)
 
 Commands (local entrypoints):
+  flow                       Canonical end-to-end lifecycle with checklist gating
+                             options: --provision auto|skip, --sweep start|resume|skip,
+                                      --wait true|false, --fetch none|all|run:<id>,
+                                      --teardown keep|delete (also accepts --key=value)
   pod-up                     Create a pod via lium (optional)
   pod-wait                   Wait until the pod is reachable over SSH
   pod-delete                 Delete the current pod (LIUM_TARGET)
@@ -364,6 +1530,11 @@ Commands (local entrypoints):
   task-wait                   Block until a task completes (success/fail/timeout)
   task-list                   List recent tasks
 
+  checklist-status            Print the live workflow checklist file
+  checklist-reset             Reset workflow checklist file to unchecked template
+                             phase court: deterministic + subagent validation enforced by
+                                      WF_PHASE_COURT_ENFORCE and WF_SUBAGENT_VALIDATOR_CMD
+
   sweep-csv-template         Create a starter sweep CSV at SWEEP_CSV (local)
   workflow-sync              Deprecated (git is source of truth; no repo sync)
   sweep-start                Upload sweep CSV + start a sequential torchrun sweep in tmux
@@ -374,6 +1545,17 @@ Commands (remote/internal):
   _sweep_run_all             Runs the sweep sequentially (used by tmux window)
   _sweep_status              Prints progress summary (used by sweep-status)
 EOF
+}
+
+is_known_command() {
+  case "$1" in
+    help|-h|--help|flow|pod-up|pod-wait|pod-delete|pod-butter|pod-status|config-sync|bootstrap|checkout|task-run|task-status|task-wait|task-list|checklist-status|checklist-reset|sweep-csv-template|workflow-sync|fsm-status|fsm-reset|sweep-start|sweep-status|fetch-run|_sweep_run_all|_sweep_status)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 validate_id() {
@@ -1927,8 +3109,19 @@ main() {
   local cmd="${1:-help}"
   shift || true
 
+  WF_ACTIVE_COMMAND="$cmd"
+
+  if ! is_known_command "$cmd"; then
+    die "unknown command: $cmd (run: bash infra_scripts/workflow.sh help)"
+  fi
+
+  if [[ "$cmd" != "help" && "$cmd" != "-h" && "$cmd" != "--help" ]]; then
+    constitution_preflight "$cmd"
+  fi
+
   case "$cmd" in
     help|-h|--help) cmd_help ;;
+    flow) cmd_flow "$@" ;;
     pod-up) cmd_pod_up "$@" ;;
     pod-wait) cmd_pod_wait "$@" ;;
     pod-delete) cmd_pod_delete "$@" ;;
@@ -1941,6 +3134,8 @@ main() {
     task-status) cmd_task_status "$@" ;;
     task-wait) cmd_task_wait "$@" ;;
     task-list) cmd_task_list "$@" ;;
+    checklist-status) cmd_checklist_status "$@" ;;
+    checklist-reset) cmd_checklist_reset "$@" ;;
     sweep-csv-template) cmd_sweep_csv_template "$@" ;;
     workflow-sync) cmd_workflow_sync "$@" ;;
     fsm-status) cmd_fsm_status "$@" ;;
@@ -1950,9 +3145,6 @@ main() {
     fetch-run) cmd_fetch_run "$@" ;;
     _sweep_run_all) cmd__sweep_run_all "$@" ;;
     _sweep_status) cmd__sweep_status "$@" ;;
-    *)
-      die "unknown command: $cmd (run: bash infra_scripts/workflow.sh help)"
-      ;;
   esac
 }
 
