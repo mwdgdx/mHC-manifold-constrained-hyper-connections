@@ -1,0 +1,21 @@
+# Workflow Checklist (auto-generated)
+
+- [x] P00 PRECHECK - constitutional preflight passed
+- [x] P10 PROVISION - pod created or provisioning skipped by policy
+- [x] P20 TARGET_BIND - LIUM target or fallback host resolved
+- [ ] P30 POD_READY - pod status and remote reachability validated
+- [ ] P40 BOOTSTRAP - prereqs/helpers completed
+- [ ] P50 CHECKOUT - repo, python env, and data contracts satisfied
+- [ ] P60 SWEEP - sweep launched or skipped by policy
+- [ ] P70 MONITOR - sweep status validation completed
+- [ ] P80 FETCH - requested artifact fetch completed or skipped
+- [ ] P90 TEARDOWN - keep/delete policy applied
+- [ ] P99 SUMMARY - final flow verdict emitted
+
+## Events
+- 2026-02-12T13:04:25Z phase=FLOW status=start note=provision=skip sweep=skip wait=false fetch=none teardown=keep
+- 2026-02-12T13:04:26Z phase=P00 status=ok note=constitutional preflight complete
+- 2026-02-12T13:04:26Z phase=P10 status=ok note=provision skipped by policy
+- 2026-02-12T13:04:26Z phase=P20 status=ok note=target resolved
+- 2026-02-12T13:04:29Z phase=P30 status=failed note=pod-status failed
+- 2026-02-12T13:04:29Z phase=P30 status=failed note=flow halted
