@@ -210,7 +210,6 @@ __marimo__/
 reference-hc/
 reference-valueres/
 docs/
-infra_scripts/
 AGENTS.md
 .DS_Store
 examples/nanogpt/out*/
