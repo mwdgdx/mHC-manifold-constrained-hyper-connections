@@ -1225,6 +1225,23 @@ config_sync() {
   log "synced config to ${REMOTE_ENV_PATH} on $(remote_id)"
 }
 
+remote_workflow_path() {
+  require_var OPS_REMOTE_OUTPUTS_DIR
+  echo "${OPS_REMOTE_OUTPUTS_DIR}/_control/workflow.sh"
+}
+
+ensure_remote_workflow_script() {
+  load_config
+  require_var OPS_REMOTE_OUTPUTS_DIR
+
+  local remote_script
+  remote_script="$(remote_workflow_path)"
+
+  remote_mkdir_p "$(dirname -- "$remote_script")"
+  remote_upload "${SCRIPT_DIR}/workflow.sh" "$remote_script"
+  remote_exec_raw "chmod 700 $(shell_escape "$remote_script") || chmod +x $(shell_escape "$remote_script") || true"
+}
+
 fsm_state_file_hint() {
   if [[ -n "${WF_STATE_FILE:-}" ]]; then
     echo "$WF_STATE_FILE"
@@ -1428,8 +1445,10 @@ Commands (local entrypoints):
 
   sweep-csv-template         Create a starter sweep CSV at SWEEP_CSV (local)
   workflow-sync              Deprecated (git is source of truth; no repo sync)
-  sweep-start                Upload sweep CSV + start a sequential torchrun sweep in tmux
+  sweep-start [--csv PATH]   Upload sweep CSV + start a sequential torchrun sweep in tmux
   sweep-status               Summarize sweep progress from SWEEP_CSV + outputs root
+  sweep-watch [--tail-lines N]
+                             Show progress fraction + active run + tmux liveness + active run tail
   fetch-run <run_id>         Fetch a single run directory into LOCAL_ARTIFACTS_DIR/<run_id>/
 
 Commands (remote/internal):
@@ -1440,7 +1459,7 @@ EOF
 
 is_known_command() {
   case "$1" in
-    help|-h|--help|flow|pod-up|pod-wait|pod-delete|pod-butter|pod-status|config-sync|bootstrap|checkout|task-run|task-status|task-wait|task-list|checklist-status|checklist-reset|sweep-csv-template|workflow-sync|fsm-status|fsm-reset|sweep-start|sweep-status|fetch-run|_sweep_run_all|_sweep_status)
+    help|-h|--help|flow|pod-up|pod-wait|pod-delete|pod-butter|pod-status|config-sync|bootstrap|checkout|task-run|task-status|task-wait|task-list|checklist-status|checklist-reset|sweep-csv-template|workflow-sync|fsm-status|fsm-reset|sweep-start|sweep-status|sweep-watch|fetch-run|_sweep_run_all|_sweep_status)
       return 0
       ;;
     *)
@@ -2411,15 +2430,40 @@ EOF
 
 cmd_sweep_start() {
   load_config
-  config_sync
-  cmd_checkout
-  fsm_require_state "sweep-start" "CHECKED_OUT" "SWEEP_COMPLETED"
+
+  local csv_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --csv)
+        [[ $# -lt 2 ]] && die "--csv requires a path"
+        csv_override="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown arg for sweep-start: $1"
+        ;;
+    esac
+  done
 
   local csv_local
-  csv_local="$(local_csv_path)"
+  if [[ -n "$csv_override" ]]; then
+    if [[ "$csv_override" = /* ]]; then
+      csv_local="$csv_override"
+    else
+      csv_local="${REPO_ROOT}/${csv_override}"
+    fi
+  else
+    csv_local="$(local_csv_path)"
+  fi
+
   if [[ ! -f "$csv_local" ]]; then
     die "sweep CSV missing: $csv_local (run: bash infra_scripts/workflow.sh sweep-csv-template)"
   fi
+
+  config_sync
+  ensure_remote_workflow_script
+  cmd_checkout
+  fsm_require_state "sweep-start" "CHECKED_OUT" "SWEEP_COMPLETED"
 
   require_var OPS_REMOTE_OUTPUTS_DIR
 
@@ -2432,6 +2476,8 @@ cmd_sweep_start() {
   remote_exec_env "ts=\"\$(date +%Y%m%d-%H%M%S)\"; cp -f \"$csv_remote_latest\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-\${ts}.csv\"; cp -f \"$REMOTE_ENV_PATH\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-\${ts}.env\""
 
   require_var SWEEP_TMUX_SESSION
+  local workflow_remote
+  workflow_remote="$(remote_workflow_path)"
 
   local tmux_cmd
   tmux_cmd="$(cat <<EOF
@@ -2439,8 +2485,7 @@ session="\$SWEEP_TMUX_SESSION"
 tmux has-session -t "\$session" 2>/dev/null || tmux new-session -d -s "\$session" -n overview
 tmux set-option -t "\$session" remain-on-exit on
 tmux list-windows -t "\$session" -F "#{window_name}" | grep -qx "sweep" && tmux kill-window -t "\$session":sweep 2>/dev/null || true
-run_cmd="cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash infra_scripts/workflow.sh _sweep_run_all --csv \"$csv_remote_latest\""
-tmux new-window -t "\$session" -n sweep "bash -lc \$(printf %q \"\$run_cmd\")"
+tmux new-window -t "\$session" -n sweep "cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash \"$workflow_remote\" _sweep_run_all --csv \"$csv_remote_latest\""
 echo "tmux attach -t \$session"
 EOF
 )"
@@ -2962,15 +3007,256 @@ cmd__sweep_status() {
 cmd_sweep_status() {
   load_config
   config_sync
+  ensure_remote_workflow_script
   fsm_promote_pod_ready_if_needed
   fsm_require_state "sweep-status" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
 
+  local workflow_remote
+  workflow_remote="$(remote_workflow_path)"
+
   local status_out
-  status_out="$(remote_exec_env 'csv_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"; cd "$OPS_REMOTE_REPO" && if [[ -f "$csv_latest" ]]; then WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status --csv "$csv_latest"; else WORKFLOW_CONFIG="$REMOTE_ENV_PATH" bash infra_scripts/workflow.sh _sweep_status; fi')"
+  status_out="$(remote_exec_env "csv_latest=\"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv\"; cd \"$OPS_REMOTE_REPO\" && if [[ -f \"\$csv_latest\" ]]; then WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash \"$workflow_remote\" _sweep_status --csv \"\$csv_latest\"; else WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash \"$workflow_remote\" _sweep_status; fi")"
   printf '%s\n' "$status_out"
   fsm_update_from_sweep_summary "$status_out"
 
   remote_exec_env 'echo "attach:"; echo "tmux attach -t $SWEEP_TMUX_SESSION"; tmux ls || true'
+}
+
+cmd_sweep_watch() {
+  load_config
+  config_sync
+  fsm_promote_pod_ready_if_needed
+  fsm_require_state "sweep-watch" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+
+  local tail_lines=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tail-lines)
+        tail_lines="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown arg for sweep-watch: $1"
+        ;;
+    esac
+  done
+
+  if [[ ! "$tail_lines" =~ ^[0-9]+$ || "$tail_lines" == 0 ]]; then
+    die "--tail-lines must be a positive integer"
+  fi
+
+  require_var OPS_REMOTE_OUTPUTS_DIR
+  require_var SWEEP_TMUX_SESSION
+  require_var SWEEP_CSV
+
+  local csv_remote_default
+  csv_remote_default="$(remote_csv_path)"
+
+  local remote_script=""
+  remote_script+=$(cat <<EOF
+TAIL_LINES=$(shell_escape "$tail_lines")
+CSV_REMOTE_DEFAULT=$(shell_escape "$csv_remote_default")
+EOF
+)
+  remote_script+=$'\n'
+
+  remote_script+=$(cat <<'EOF'
+csv_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"
+if [[ -f "$csv_latest" ]]; then
+  csv="$csv_latest"
+else
+  csv="$CSV_REMOTE_DEFAULT"
+fi
+
+if [[ ! -f "$csv" ]]; then
+  die "remote sweep CSV not found: $csv"
+fi
+
+py_out="$(python3 - <<'PY' "$OPS_REMOTE_OUTPUTS_DIR" "$csv"
+import csv as csv_mod
+import io
+import json
+import os
+import sys
+
+outputs_root = sys.argv[1]
+csv_path = sys.argv[2]
+
+match = os.environ.get("SWEEP_MATCH", "")
+start_at = os.environ.get("SWEEP_START_AT", "")
+limit_raw = os.environ.get("SWEEP_LIMIT", "")
+limit = None
+if limit_raw:
+    try:
+        limit = int(limit_raw)
+    except Exception:
+        limit = None
+
+total = 0
+ok = 0
+failed = 0
+in_progress = 0
+missing_dir = 0
+parse_error = 0
+
+started = not bool(start_at)
+active_run = ""
+active_idx = ""
+active_log = ""
+completed = 0
+
+with open(csv_path, "r", encoding="utf-8") as f:
+    lines = f.read().splitlines()
+
+for raw in lines:
+    if not raw:
+        continue
+    if raw.startswith("run_id,"):
+        continue
+    if raw.startswith("#"):
+        continue
+
+    if match and match not in raw:
+        continue
+
+    try:
+        row = next(csv_mod.reader(io.StringIO(raw)))
+    except Exception:
+        continue
+
+    if not row:
+        continue
+    run_id = row[0].strip().strip('"')
+    if not run_id:
+        continue
+
+    if not started:
+        if run_id == start_at:
+            started = True
+        else:
+            continue
+
+    if limit is not None and total >= limit:
+        break
+
+    total += 1
+    run_dir = os.path.join(outputs_root, run_id)
+    summary_path = os.path.join(run_dir, "summary.json")
+    status_path = os.path.join(run_dir, "status.json")
+    stdout_log = os.path.join(run_dir, "stdout.log")
+
+    status_state = ""
+    if os.path.isfile(status_path):
+        try:
+            with open(status_path, "r", encoding="utf-8") as sf:
+                status_state = str(json.load(sf).get("state", ""))
+        except Exception:
+            status_state = "parse_error"
+
+    if not os.path.isdir(run_dir):
+        missing_dir += 1
+        continue
+
+    if not os.path.isfile(summary_path):
+        in_progress += 1
+        if not active_run and status_state == "running":
+            active_run = run_id
+            active_idx = str(total)
+            active_log = stdout_log if os.path.isfile(stdout_log) else ""
+        continue
+
+    try:
+        with open(summary_path, "r", encoding="utf-8") as sf:
+            summary = json.load(sf)
+        if summary.get("ok") is True:
+            ok += 1
+        else:
+            failed += 1
+    except Exception:
+        parse_error += 1
+
+completed = ok + failed + parse_error
+
+if not active_run and in_progress > 0:
+    # fallback: choose first run that has directory but no summary
+    started = not bool(start_at)
+    for raw in lines:
+        if not raw or raw.startswith("run_id,") or raw.startswith("#"):
+            continue
+        if match and match not in raw:
+            continue
+        try:
+            row = next(csv_mod.reader(io.StringIO(raw)))
+        except Exception:
+            continue
+        if not row:
+            continue
+        run_id = row[0].strip().strip('"')
+        if not run_id:
+            continue
+        if not started:
+            if run_id == start_at:
+                started = True
+            else:
+                continue
+        run_dir = os.path.join(outputs_root, run_id)
+        summary_path = os.path.join(run_dir, "summary.json")
+        if os.path.isdir(run_dir) and not os.path.isfile(summary_path):
+            active_run = run_id
+            active_log = os.path.join(run_dir, "stdout.log")
+            break
+
+print(f"total={total} ok={ok} failed={failed} in_progress={in_progress} missing_dir={missing_dir} parse_error={parse_error}")
+print(f"progress={completed}/{total}")
+print(f"current_run={active_run if active_run else '-'}")
+print(f"current_index={active_idx if active_idx else '-'}")
+print(f"current_log={active_log if active_log else '-'}")
+PY
+)"
+
+summary_line="$(printf '%s\n' "$py_out" | sed -n '1p')"
+progress_line="$(printf '%s\n' "$py_out" | sed -n '2p')"
+current_run_line="$(printf '%s\n' "$py_out" | sed -n '3p')"
+current_index_line="$(printf '%s\n' "$py_out" | sed -n '4p')"
+current_log_line="$(printf '%s\n' "$py_out" | sed -n '5p')"
+
+printf '%s\n' "$summary_line"
+printf '%s\n' "$progress_line"
+printf '%s\n' "$current_index_line"
+printf '%s\n' "$current_run_line"
+
+tmux_alive="no"
+if tmux has-session -t "$SWEEP_TMUX_SESSION" 2>/dev/null; then
+  tmux_alive="yes"
+fi
+echo "tmux_alive=$tmux_alive"
+echo "attach=tmux attach -t $SWEEP_TMUX_SESSION"
+
+current_log="${current_log_line#current_log=}"
+current_run="${current_run_line#current_run=}"
+echo "--- tail (last ${TAIL_LINES}) ---"
+if [[ -n "$current_log" && "$current_log" != "-" && -f "$current_log" ]]; then
+  echo "log=$current_log"
+  tail -n "$TAIL_LINES" "$current_log"
+else
+  if [[ -n "$current_run" && "$current_run" != "-" ]]; then
+    echo "missing log for current run: $current_run"
+  else
+    echo "no active run"
+  fi
+fi
+EOF
+)
+
+  local watch_out
+  watch_out="$(remote_exec_env "$remote_script")"
+  printf '%s\n' "$watch_out"
+
+  local summary_line
+  summary_line="$(printf '%s\n' "$watch_out" | grep -E '^total=' | head -n 1 || true)"
+  if [[ -n "$summary_line" ]]; then
+    fsm_update_from_sweep_summary "$summary_line"
+  fi
 }
 
 cmd_fetch_run() {
@@ -3033,6 +3319,7 @@ main() {
     fsm-reset) cmd_fsm_reset "$@" ;;
     sweep-start) cmd_sweep_start "$@" ;;
     sweep-status) cmd_sweep_status "$@" ;;
+    sweep-watch) cmd_sweep_watch "$@" ;;
     fetch-run) cmd_fetch_run "$@" ;;
     _sweep_run_all) cmd__sweep_run_all "$@" ;;
     _sweep_status) cmd__sweep_status "$@" ;;
