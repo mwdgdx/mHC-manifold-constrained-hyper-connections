@@ -218,6 +218,12 @@ examples/nanogpt/data/shakespeare_char/input.txt
 examples/nanogpt/data/shakespeare_char/*.bin
 examples/nanogpt/data/shakespeare_char/meta.json
 pyrightconfig.json
+
+# infra scripts local env (do not commit)
+infra_scripts/project.env
 mhc_export.tgz
 remote-ops.md
 scripts/
+wandb/
+artifacts/
+diary/
