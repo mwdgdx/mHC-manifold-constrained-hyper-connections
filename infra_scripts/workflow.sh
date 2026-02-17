@@ -676,6 +676,8 @@ if in_progress > 0:
     print("running")
 elif total > 0 and total == ok + failed and missing_dir == 0 and parse_error == 0:
     print("completed")
+elif failed > 0 or parse_error > 0:
+    print("stalled")
 else:
     print("unknown")
 PY
@@ -686,6 +688,9 @@ PY
         return 0
         ;;
       running)
+        ;;
+      stalled)
+        die "flow wait: sweep stalled"
         ;;
       *)
         die "flow wait: sweep status is not converging (phase=${phase})"
@@ -722,6 +727,49 @@ with path.open("r", newline="") as f:
           print(run_id)
 PY
 )
+}
+
+artifacts_sync_phase_for_csv() {
+  local csv_path="$1"
+  local artifacts_root="$2"
+
+  python3 - <<'PY' "$csv_path" "$artifacts_root"
+import csv
+import pathlib
+import sys
+
+csv_path = pathlib.Path(sys.argv[1])
+artifacts_root = pathlib.Path(sys.argv[2])
+
+if not csv_path.exists():
+    print("unknown")
+    raise SystemExit(0)
+
+runs = []
+with csv_path.open("r", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        run_id = (row.get("run_id") or "").strip()
+        if run_id:
+            runs.append(run_id)
+
+if not runs:
+    print("none")
+    raise SystemExit(0)
+
+required = ("status.json", "summary.json", "stdout.log")
+for run_id in runs:
+    run_dir = artifacts_root / run_id
+    if not run_dir.is_dir():
+        print("partial")
+        raise SystemExit(0)
+    for name in required:
+        if not (run_dir / name).is_file():
+            print("partial")
+            raise SystemExit(0)
+
+print("synced")
+PY
 }
 
 run_workflow_subcommand() {
@@ -1337,7 +1385,7 @@ fsm_promote_pod_ready_if_needed() {
 
   local state
   state="$(fsm_get_remote_state)"
-  if [[ "$state" == "INIT" ]]; then
+  if [[ "$state" == "INIT" || "$state" == "POD_TERMINATED" ]]; then
     fsm_set_remote_state "POD_READY" "auto-promote: remote reachable"
   fi
 }
@@ -1396,12 +1444,17 @@ if in_progress > 0:
     print("running")
 elif total == ok + failed and missing_dir == 0 and parse_error == 0 and total > 0:
     print("completed")
+elif failed > 0 or parse_error > 0:
+    print("stalled")
 else:
     print("unknown")
 PY
 )"
 
   case "$phase" in
+    stalled)
+      fsm_set_remote_state "SWEEP_STALLED" "sweep-status: stalled"
+      ;;
     running)
       fsm_set_remote_state "SWEEP_RUNNING" "sweep-status: in progress"
       ;;
@@ -1449,6 +1502,7 @@ Commands (local entrypoints):
   sweep-status               Summarize sweep progress from SWEEP_CSV + outputs root
   sweep-watch [--tail-lines N]
                              Show progress fraction + active run + tmux liveness + active run tail
+  fetch-all                  Fetch all runs listed in active SWEEP_CSV
   fetch-run <run_id>         Fetch a single run directory into LOCAL_ARTIFACTS_DIR/<run_id>/
 
 Commands (remote/internal):
@@ -1459,7 +1513,7 @@ EOF
 
 is_known_command() {
   case "$1" in
-    help|-h|--help|flow|pod-up|pod-wait|pod-delete|pod-butter|pod-status|config-sync|bootstrap|checkout|task-run|task-status|task-wait|task-list|checklist-status|checklist-reset|sweep-csv-template|workflow-sync|fsm-status|fsm-reset|sweep-start|sweep-status|sweep-watch|fetch-run|_sweep_run_all|_sweep_status)
+    help|-h|--help|flow|pod-up|pod-wait|pod-delete|pod-butter|pod-status|config-sync|bootstrap|checkout|task-run|task-status|task-wait|task-list|checklist-status|checklist-reset|sweep-csv-template|workflow-sync|fsm-status|fsm-reset|sweep-start|sweep-status|sweep-watch|fetch-all|fetch-run|_sweep_run_all|_sweep_status)
       return 0
       ;;
     *)
@@ -1493,7 +1547,7 @@ cmd_task_run() {
   config_sync
   require_var OPS_REMOTE_OUTPUTS_DIR
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "task-run" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+  fsm_require_state "task-run" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "PRECHECKED" "SWEEP_LAUNCHED" "SWEEP_RUNNING" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   local task_id=""
   local task_cmd=""
@@ -2007,7 +2061,7 @@ cmd_pod_delete() {
 
   if [[ -n "${OPS_REMOTE_OUTPUTS_DIR:-}" && -n "${REMOTE_ENV_PATH:-}" ]]; then
     if config_sync >/dev/null 2>&1; then
-      fsm_set_remote_state "INIT" "pod-delete: reset state" || true
+      fsm_set_remote_state "POD_TERMINATED" "pod-delete: terminated" || true
     fi
   fi
 
@@ -2108,7 +2162,7 @@ cmd_fsm_reset() {
 
   local state="${1:-INIT}"
   case "$state" in
-    INIT|POD_READY|BOOTSTRAPPED|CHECKED_OUT|SWEEP_RUNNING|SWEEP_COMPLETED) ;;
+    INIT|POD_READY|BOOTSTRAPPED|CHECKED_OUT|PRECHECKED|SWEEP_LAUNCHED|SWEEP_RUNNING|SWEEP_STALLED|SWEEP_COMPLETED|ARTIFACTS_FETCHING|ARTIFACTS_SYNCED|POD_TERMINATED) ;;
     *) die "invalid state for fsm-reset: $state" ;;
   esac
 
@@ -2188,7 +2242,7 @@ cmd_bootstrap() {
   load_config
   config_sync
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "bootstrap" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_COMPLETED"
+  fsm_require_state "bootstrap" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "PRECHECKED" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   remote_exec_env 'command -v tmux >/dev/null 2>&1 || echo "tmux missing"; command -v git >/dev/null 2>&1 || echo "git missing"; command -v python3 >/dev/null 2>&1 || echo "python3 missing"'
 
@@ -2217,7 +2271,7 @@ cmd_checkout() {
   load_config
   config_sync
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "checkout" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "SWEEP_COMPLETED"
+  fsm_require_state "checkout" "POD_READY" "BOOTSTRAPPED" "CHECKED_OUT" "PRECHECKED" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   require_var OPS_REMOTE_REPO
   require_var OPS_REMOTE_OUTPUTS_DIR
@@ -2463,7 +2517,7 @@ cmd_sweep_start() {
   config_sync
   ensure_remote_workflow_script
   cmd_checkout
-  fsm_require_state "sweep-start" "CHECKED_OUT" "SWEEP_COMPLETED"
+  fsm_require_state "sweep-start" "CHECKED_OUT" "PRECHECKED" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   require_var OPS_REMOTE_OUTPUTS_DIR
 
@@ -2474,6 +2528,8 @@ cmd_sweep_start() {
   csv_remote_latest="$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-latest.csv"
   remote_upload "$csv_local" "$csv_remote_latest"
   remote_exec_env "ts=\"\$(date +%Y%m%d-%H%M%S)\"; cp -f \"$csv_remote_latest\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/sweep-\${ts}.csv\"; cp -f \"$REMOTE_ENV_PATH\" \"$OPS_REMOTE_OUTPUTS_DIR/_manifests/workflow-\${ts}.env\""
+
+  fsm_set_remote_state "PRECHECKED" "sweep-start: preflight complete"
 
   require_var SWEEP_TMUX_SESSION
   local workflow_remote
@@ -2486,11 +2542,12 @@ tmux has-session -t "\$session" 2>/dev/null || tmux new-session -d -s "\$session
 tmux set-option -t "\$session" remain-on-exit on
 tmux list-windows -t "\$session" -F "#{window_name}" | grep -qx "sweep" && tmux kill-window -t "\$session":sweep 2>/dev/null || true
 tmux new-window -t "\$session" -n sweep "cd \"$OPS_REMOTE_REPO\" && WORKFLOW_CONFIG=\"$REMOTE_ENV_PATH\" bash \"$workflow_remote\" _sweep_run_all --csv \"$csv_remote_latest\""
+tmux list-windows -t "\$session" -F "#{window_name}" | grep -qx "sweep"
 echo "tmux attach -t \$session"
 EOF
 )"
   remote_exec_env "$tmux_cmd"
-  fsm_set_remote_state "SWEEP_RUNNING" "sweep-start launched"
+  fsm_set_remote_state "SWEEP_LAUNCHED" "sweep-start launched"
 }
 
 strip_quotes() {
@@ -3009,7 +3066,7 @@ cmd_sweep_status() {
   config_sync
   ensure_remote_workflow_script
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "sweep-status" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+  fsm_require_state "sweep-status" "CHECKED_OUT" "PRECHECKED" "SWEEP_LAUNCHED" "SWEEP_RUNNING" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   local workflow_remote
   workflow_remote="$(remote_workflow_path)"
@@ -3026,7 +3083,7 @@ cmd_sweep_watch() {
   load_config
   config_sync
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "sweep-watch" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+  fsm_require_state "sweep-watch" "CHECKED_OUT" "PRECHECKED" "SWEEP_LAUNCHED" "SWEEP_RUNNING" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
 
   local tail_lines=10
   while [[ $# -gt 0 ]]; do
@@ -3254,7 +3311,54 @@ EOF
 
   local summary_line
   summary_line="$(printf '%s\n' "$watch_out" | grep -E '^total=' | head -n 1 || true)"
-  if [[ -n "$summary_line" ]]; then
+  local tmux_line
+  tmux_line="$(printf '%s\n' "$watch_out" | grep -E '^tmux_alive=' | head -n 1 || true)"
+  local current_run_line
+  current_run_line="$(printf '%s\n' "$watch_out" | grep -E '^current_run=' | head -n 1 || true)"
+
+  local stall_eval stalled_line stall_reason_line stalled_flag stall_reason
+  stall_eval="$(python3 - <<'PY' "$summary_line" "$tmux_line" "$current_run_line"
+import re
+import sys
+
+summary = sys.argv[1]
+tmux_line = sys.argv[2]
+run_line = sys.argv[3]
+
+stalled = "no"
+reason = "-"
+
+m = re.search(r"total=(\d+)\s+ok=(\d+)\s+failed=(\d+)\s+in_progress=(\d+)\s+missing_dir=(\d+)\s+parse_error=(\d+)", summary)
+tmux_alive = tmux_line.split("=", 1)[1] if tmux_line.startswith("tmux_alive=") else "unknown"
+current_run = run_line.split("=", 1)[1] if run_line.startswith("current_run=") else "-"
+
+if m:
+    _total, _ok, failed, in_progress, _missing_dir, parse_error = map(int, m.groups())
+    if failed > 0 or parse_error > 0:
+        stalled = "yes"
+        reason = "failed_or_parse_error"
+    elif in_progress > 0 and tmux_alive != "yes":
+        stalled = "yes"
+        reason = "tmux_not_alive"
+    elif in_progress > 0 and current_run in ("", "-"):
+        stalled = "yes"
+        reason = "in_progress_without_active_run"
+
+print(f"stalled={stalled}")
+print(f"stall_reason={reason}")
+PY
+)"
+
+  stalled_line="$(printf '%s\n' "$stall_eval" | sed -n '1p')"
+  stall_reason_line="$(printf '%s\n' "$stall_eval" | sed -n '2p')"
+  stalled_flag="${stalled_line#stalled=}"
+  stall_reason="${stall_reason_line#stall_reason=}"
+  printf '%s\n' "$stalled_line"
+  printf '%s\n' "$stall_reason_line"
+
+  if [[ "$stalled_flag" == "yes" ]]; then
+    fsm_set_remote_state "SWEEP_STALLED" "sweep-watch: ${stall_reason:-stalled}" || true
+  elif [[ -n "$summary_line" ]]; then
     fsm_update_from_sweep_summary "$summary_line"
   fi
 }
@@ -3263,23 +3367,69 @@ cmd_fetch_run() {
   load_config
   config_sync
   fsm_promote_pod_ready_if_needed
-  fsm_require_state "fetch-run" "CHECKED_OUT" "SWEEP_RUNNING" "SWEEP_COMPLETED"
+  fsm_require_state "fetch-run" "CHECKED_OUT" "PRECHECKED" "SWEEP_LAUNCHED" "SWEEP_RUNNING" "SWEEP_STALLED" "SWEEP_COMPLETED" "ARTIFACTS_FETCHING" "ARTIFACTS_SYNCED"
   require_var OPS_REMOTE_OUTPUTS_DIR
   require_var LOCAL_ARTIFACTS_DIR
 
   local run_id="${1:-}"
   [[ -n "$run_id" ]] || die "usage: fetch-run <run_id>"
 
+  fsm_set_remote_state "ARTIFACTS_FETCHING" "fetch-run: ${run_id}" || true
+
   local tmp_remote="/tmp/${run_id}.tar.gz"
   local tmp_local="${LOCAL_ARTIFACTS_DIR}/${run_id}.tar.gz"
   mkdir -p "$LOCAL_ARTIFACTS_DIR"
 
-  remote_exec_env "tar -C \"$OPS_REMOTE_OUTPUTS_DIR\" -czf \"$tmp_remote\" \"$run_id\""
+  if is_truthy "${FETCH_INCLUDE_CHECKPOINTS:-0}"; then
+    remote_exec_env "tar -C \"$OPS_REMOTE_OUTPUTS_DIR\" -czf \"$tmp_remote\" \"$run_id\""
+  else
+    remote_exec_env "tar -C \"$OPS_REMOTE_OUTPUTS_DIR\" --exclude=\"$run_id/ckpt.pt\" --exclude=\"$run_id/*.ckpt\" --exclude=\"$run_id/checkpoints\" -czf \"$tmp_remote\" \"$run_id\""
+  fi
   remote_download "$tmp_remote" "$tmp_local"
   tar -xzf "$tmp_local" -C "$LOCAL_ARTIFACTS_DIR"
   rm -f "$tmp_local"
   remote_exec_env "rm -f \"$tmp_remote\" || true"
+
+  local csv_local sync_phase
+  csv_local="$(local_csv_path)"
+  if [[ -f "$csv_local" ]]; then
+    sync_phase="$(artifacts_sync_phase_for_csv "$csv_local" "$LOCAL_ARTIFACTS_DIR")"
+  else
+    sync_phase="unknown"
+  fi
+
+  if [[ "$sync_phase" == "synced" ]]; then
+    fsm_set_remote_state "ARTIFACTS_SYNCED" "fetch-run: local manifest artifacts synced"
+  else
+    fsm_set_remote_state "ARTIFACTS_FETCHING" "fetch-run: local artifacts partial"
+  fi
+
   log "fetched: ${LOCAL_ARTIFACTS_DIR}/${run_id}/"
+}
+
+cmd_fetch_all() {
+  load_config
+  local csv
+  csv="$(local_csv_path)"
+  [[ -f "$csv" ]] || die "fetch-all requires sweep CSV: $csv"
+
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    cmd_fetch_run "$run_id"
+  done < <(python3 - <<'PY' "$csv"
+import csv
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("r", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        run_id = (row.get("run_id") or "").strip()
+        if run_id:
+            print(run_id)
+PY
+)
 }
 
 main() {
@@ -3320,6 +3470,7 @@ main() {
     sweep-start) cmd_sweep_start "$@" ;;
     sweep-status) cmd_sweep_status "$@" ;;
     sweep-watch) cmd_sweep_watch "$@" ;;
+    fetch-all) cmd_fetch_all "$@" ;;
     fetch-run) cmd_fetch_run "$@" ;;
     _sweep_run_all) cmd__sweep_run_all "$@" ;;
     _sweep_status) cmd__sweep_status "$@" ;;
