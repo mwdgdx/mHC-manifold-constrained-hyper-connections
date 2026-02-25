@@ -95,33 +95,25 @@ run() {
     echo ""
 }
 
-# --------------- package install ----------------------------------------------
+# --------------- pre-flight checks -------------------------------------------
 
-REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+_fail=0
+
 if ! python -c "import hyper_connections" 2>/dev/null; then
-    echo "Installing hyper_connections package..."
-    pip install -e "$REPO_ROOT" 2>&1 | tail -1
-    echo ""
+    echo "ERROR: hyper_connections not installed."
+    _fail=1
 fi
 
-# --------------- dataset check -----------------------------------------------
-
 DATA_DIR="${ROOT}/data/fineweb10B"
-NUM_TRAIN_SHARDS="${NUM_TRAIN_SHARDS:-9}"
 if ! ls "${DATA_DIR}"/fineweb_train_*.bin &>/dev/null 2>&1; then
-    echo "No training shards found in ${DATA_DIR}"
+    echo "ERROR: No training data in ${DATA_DIR}."
+    _fail=1
+fi
+
+if [ "$_fail" -eq 1 ]; then
     echo ""
-    echo "  NUM_TRAIN_SHARDS=${NUM_TRAIN_SHARDS}  (override with env var; 103 = full 10B)"
-    echo ""
-    read -rp "Download ${NUM_TRAIN_SHARDS} shards now? [Y/n] " ans
-    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
-        echo "Downloading..."
-        python "${DATA_DIR}/download.py" "${NUM_TRAIN_SHARDS}"
-        echo ""
-    else
-        echo "Skipping download. Training will fail without data."
-        exit 1
-    fi
+    echo "Run setup first:  source setup_env.sh"
+    exit 1
 fi
 
 # --------------- experiment sets ---------------------------------------------
