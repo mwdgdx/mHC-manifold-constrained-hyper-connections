@@ -116,6 +116,7 @@ wandb_run_name = "baseline"
 wandb_group = None
 wandb_log_layer_stats = True
 wandb_log_layer_cosine = True
+wandb_log_amax = True
 
 # DDP backend: "nccl", "gloo", etc.
 # If NCCL fails, set NCCL_IB_DISABLE=1 or use backend="gloo"
@@ -651,6 +652,50 @@ def forward_with_layer_cosine(x, y):
     return loss, sims
 
 
+@torch.no_grad()
+def compute_amax():
+    """Compute Amax Gain Magnitude of composite ∏ H_res across all HC/mHC layers.
+
+    Returns None for baseline (no HyperConnections layers).
+    Follows the DeepSeek mHC paper (arXiv:2512.24880) methodology:
+      - Forward Amax = max absolute row sum of composite mapping
+      - Backward Amax = max absolute column sum of composite mapping
+    """
+    h_res_list = []
+    for block in raw_model.transformer.h:
+        for hc in (block.hc_attn, block.hc_mlp):
+            if isinstance(hc, HyperConnections):
+                h_res_list.append(hc.get_h_res())
+
+    if not h_res_list:
+        return None
+
+    per_layer_fwd = []
+    per_layer_bwd = []
+    for H in h_res_list:
+        per_layer_fwd.append(H.abs().sum(dim=-1).max().item())
+        per_layer_bwd.append(H.abs().sum(dim=-2).max().item())
+
+    composite = h_res_list[0].float()
+    composite_fwd = [composite.abs().sum(dim=-1).max().item()]
+    composite_bwd = [composite.abs().sum(dim=-2).max().item()]
+
+    for H in h_res_list[1:]:
+        composite = H.float() @ composite
+        composite_fwd.append(composite.abs().sum(dim=-1).max().item())
+        composite_bwd.append(composite.abs().sum(dim=-2).max().item())
+
+    return {
+        "amax_fwd": composite_fwd[-1],
+        "amax_bwd": composite_bwd[-1],
+        "amax_max": max(composite_fwd[-1], composite_bwd[-1]),
+        "per_layer_fwd": per_layer_fwd,
+        "per_layer_bwd": per_layer_bwd,
+        "composite_fwd": composite_fwd,
+        "composite_bwd": composite_bwd,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Evaluation
 
@@ -745,6 +790,7 @@ try:
             "tokens_per_iter": tokens_per_iter,
             "wandb_log_layer_stats": wandb_log_layer_stats,
             "wandb_log_layer_cosine": wandb_log_layer_cosine,
+            "wandb_log_amax": wandb_log_amax,
         },
         )
 
@@ -759,9 +805,16 @@ try:
             losses, layer_cosine = estimate_loss()
             last_eval_losses = losses
             last_eval_iter = iter_num
-            print(
-                f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-            )
+            amax_result = compute_amax() if wandb_log_amax else None
+            if amax_result is not None:
+                print(
+                    f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
+                    f"Amax fwd {amax_result['amax_fwd']:.2f} bwd {amax_result['amax_bwd']:.2f}"
+                )
+            else:
+                print(
+                    f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                )
             if wandb is not None:
                 eval_log = {
                     "val/loss": losses["val"],
@@ -769,7 +822,24 @@ try:
                     "perf/elapsed_s": time.time() - start_time,
                     "tokens/seen": iter_num * tokens_per_iter,
                 }
+                if amax_result is not None:
+                    eval_log["amax/fwd"] = amax_result["amax_fwd"]
+                    eval_log["amax/bwd"] = amax_result["amax_bwd"]
+                    eval_log["amax/max"] = amax_result["amax_max"]
                 wandb.log(eval_log, step=iter_num)
+                if amax_result is not None:
+                    amax_table = wandb.Table(
+                        columns=["layer", "single_fwd", "single_bwd", "composite_fwd", "composite_bwd"]
+                    )
+                    for idx in range(len(amax_result["per_layer_fwd"])):
+                        amax_table.add_data(
+                            idx,
+                            amax_result["per_layer_fwd"][idx],
+                            amax_result["per_layer_bwd"][idx],
+                            amax_result["composite_fwd"][idx],
+                            amax_result["composite_bwd"][idx],
+                        )
+                    wandb.log({"amax/per_layer": amax_table}, step=iter_num)
                 if wandb_log_layer_cosine and layer_cosine is not None:
                     layer_table = wandb.Table(columns=["layer", "cosine"])
                     for idx, value in enumerate(layer_cosine):
@@ -885,6 +955,7 @@ finally:
             "best_val_loss": float(best_val_loss),
             "last_eval_iter": int(last_eval_iter) if last_eval_iter is not None else None,
             "last_eval": _json_safe(last_eval_losses) if last_eval_losses is not None else None,
+            "final_amax": _json_safe(compute_amax()),
             "ddp": bool(ddp),
             "world_size": int(ddp_world_size),
             "device": str(device),
