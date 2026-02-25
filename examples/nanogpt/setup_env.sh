@@ -59,16 +59,16 @@ if ls "${_DATA_DIR}"/fineweb_train_*.bin &>/dev/null 2>&1; then
     _N_SHARDS=$(ls "${_DATA_DIR}"/fineweb_train_*.bin 2>/dev/null | wc -l)
     echo "  Found ${_N_SHARDS} training shard(s) in ${_DATA_DIR}."
 else
-    echo "  No training data found."
-    echo "  Shard options:"
-    echo "    9   = smoke test (~1.8B tokens, fast download)"
-    echo "    103 = full FineWeb10B (~10B tokens)"
+    echo "  No training data found. The dataset is split into shards (~200MB each)."
+    echo ""
+    echo "    9   shards = ~0.9B tokens, ~1.8 GB  (quick test, recommended to start)"
+    echo "    103 shards = ~10B tokens,  ~20 GB   (full dataset for real experiments)"
     echo ""
 
     if [[ "${1:-}" != "--skip" ]]; then
-        read -rp "  How many shards to download? [9]: " _N_SHARDS_DL
+        read -rp "  How many shards? [9]: " _N_SHARDS_DL
         _N_SHARDS_DL="${_N_SHARDS_DL:-9}"
-        echo "  Downloading ${_N_SHARDS_DL} shard(s)..."
+        echo "  Downloading ${_N_SHARDS_DL} shard(s) from HuggingFace..."
         python "${_DATA_DIR}/download.py" "${_N_SHARDS_DL}"
     else
         echo "  Skipped (--skip). Download manually before training:"
