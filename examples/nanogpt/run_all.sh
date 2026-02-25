@@ -95,17 +95,33 @@ run() {
     echo ""
 }
 
+# --------------- package install ----------------------------------------------
+
+REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+if ! python -c "import hyper_connections" 2>/dev/null; then
+    echo "Installing hyper_connections package..."
+    pip install -e "$REPO_ROOT" 2>&1 | tail -1
+    echo ""
+fi
+
 # --------------- dataset check -----------------------------------------------
 
 DATA_DIR="${ROOT}/data/fineweb10B"
+NUM_TRAIN_SHARDS="${NUM_TRAIN_SHARDS:-9}"
 if ! ls "${DATA_DIR}"/fineweb_train_*.bin &>/dev/null 2>&1; then
-    echo "WARNING: No training shards found in ${DATA_DIR}"
-    echo "Download first:"
-    echo "  cd ${DATA_DIR} && python download.py 9     # smoke test (9 shards)"
-    echo "  cd ${DATA_DIR} && python download.py 103   # full dataset"
+    echo "No training shards found in ${DATA_DIR}"
     echo ""
-    read -rp "Continue anyway? [y/N] " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 1
+    echo "  NUM_TRAIN_SHARDS=${NUM_TRAIN_SHARDS}  (override with env var; 103 = full 10B)"
+    echo ""
+    read -rp "Download ${NUM_TRAIN_SHARDS} shards now? [Y/n] " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+        echo "Downloading..."
+        python "${DATA_DIR}/download.py" "${NUM_TRAIN_SHARDS}"
+        echo ""
+    else
+        echo "Skipping download. Training will fail without data."
+        exit 1
+    fi
 fi
 
 # --------------- experiment sets ---------------------------------------------
