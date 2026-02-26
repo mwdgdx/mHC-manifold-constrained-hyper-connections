@@ -361,37 +361,6 @@ class HyperConnections(Module):
                 alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
                 self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
 
-    @torch.no_grad()
-    def get_h_res(self):
-        """Return the effective H_res matrix (s x s) for Amax computation.
-
-        For mHC: projects H_res_logits via Sinkhorn or orthostochastic.
-        For HC:  returns the static alpha residual sub-matrix (dominant term).
-        """
-        s = self.num_residual_streams
-
-        if self.mhc:
-            if self.mhc_h_res_proj == "orthostochastic":
-                S = orthostochastic_project(
-                    self.H_res_logits,
-                    ns_steps=self.ns_steps,
-                    ns_eps=self.ns_eps,
-                    ns_coeffs=self.ns_coeffs,
-                )
-            else:
-                S = sinkhorn_log(
-                    self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau
-                )
-
-            if self.mhc_residual_identity_mix:
-                alpha = torch.sigmoid(self.H_res_alpha_logit)
-                I = torch.eye(s, device=S.device, dtype=S.dtype)
-                return (1 - alpha) * I + alpha * S
-            return S
-
-        nv = self.num_input_views * self.num_fracs
-        return self.static_alpha[:, nv:].detach()
-
     def width_connection(self, residuals):
         streams = self.num_residual_streams
 
@@ -441,6 +410,9 @@ class HyperConnections(Module):
                 H_res = (1 - alpha) * I + alpha * S
             else:
                 H_res = S
+
+            if getattr(self, '_collect_h_res', False):
+                self._last_h_res = H_res.detach()
 
             H_pre = F.softmax(self.H_pre_logits, dim=-1)
 
@@ -500,6 +472,10 @@ class HyperConnections(Module):
         alpha = self.split_fracs(
             alpha
         )  # (batch, seq, fracs1, streams, fracs2, input + residual streams)
+
+        if getattr(self, '_collect_h_res', False):
+            nv = self.num_input_views
+            self._last_h_res = alpha[:, :, 0, :, 0, nv:].detach()
 
         # beta for weights from branch output back to residual streams
 

@@ -654,36 +654,77 @@ def forward_with_layer_cosine(x, y):
 
 @torch.no_grad()
 def compute_amax():
-    """Compute Amax Gain Magnitude of composite ∏ H_res across all HC/mHC layers.
+    """Compute Amax Gain Magnitude per the DeepSeek mHC paper (arXiv:2512.24880).
+
+    Runs one forward pass to capture actual H_res matrices (including the
+    dynamic input-dependent component for HC), then computes:
+      Forward Amax  = max|row sum| of composite mapping (paper convention)
+      Backward Amax = max|col sum| of composite mapping (paper convention)
+    Averaged over all tokens in the batch.
 
     Returns None for baseline (no HyperConnections layers).
-    Follows the DeepSeek mHC paper (arXiv:2512.24880) methodology:
-      - Forward Amax = max absolute row sum of composite mapping
-      - Backward Amax = max absolute column sum of composite mapping
     """
-    h_res_list = []
+    hc_layers = []
     for block in raw_model.transformer.h:
         for hc in (block.hc_attn, block.hc_mlp):
             if isinstance(hc, HyperConnections):
-                h_res_list.append(hc.get_h_res())
+                hc_layers.append(hc)
 
-    if not h_res_list:
+    if not hc_layers:
         return None
+
+    try:
+        for hc in hc_layers:
+            hc._collect_h_res = True
+        was_training = raw_model.training
+        raw_model.eval()
+        x, y = get_batch("val")
+        with ctx:
+            raw_model(x, y)
+        if was_training:
+            raw_model.train()
+        h_res_list = [hc._last_h_res.float() for hc in hc_layers]
+    finally:
+        for hc in hc_layers:
+            hc._collect_h_res = False
+            hc.__dict__.pop('_last_h_res', None)
+
+    # H_res convention in this codebase: H[from, to]
+    #   einsum "s t, ... s d -> ... t d" — s is contracted (input), t is output
+    # Paper convention (standard matrix): M = H^T, so M[to, from]
+    #   paper "forward Amax"  = max|row sum of M| = max_t |Σ_s H[s,t]| = max|col sum of H|
+    #   paper "backward Amax" = max|col sum of M| = max_s |Σ_t H[s,t]| = max|row sum of H|
+
+    is_per_token = h_res_list[0].dim() > 2
 
     per_layer_fwd = []
     per_layer_bwd = []
-    for H in h_res_list:
-        per_layer_fwd.append(H.abs().sum(dim=-1).max().item())
-        per_layer_bwd.append(H.abs().sum(dim=-2).max().item())
+    composite_fwd = []
+    composite_bwd = []
+    composite = None
 
-    composite = h_res_list[0].float()
-    composite_fwd = [composite.abs().sum(dim=-1).max().item()]
-    composite_bwd = [composite.abs().sum(dim=-2).max().item()]
+    for i, H in enumerate(h_res_list):
+        composite = H if i == 0 else (
+            torch.matmul(composite, H) if is_per_token else composite @ H
+        )
 
-    for H in h_res_list[1:]:
-        composite = H.float() @ composite
-        composite_fwd.append(composite.abs().sum(dim=-1).max().item())
-        composite_bwd.append(composite.abs().sum(dim=-2).max().item())
+        if is_per_token:
+            # H shape: (B, seq, s_from, s_to)
+            pf = H.sum(dim=-2).abs().max(dim=-1).values.mean().item()
+            pb = H.sum(dim=-1).abs().max(dim=-1).values.mean().item()
+            cf = composite.sum(dim=-2).abs().max(dim=-1).values.mean().item()
+            cb = composite.sum(dim=-1).abs().max(dim=-1).values.mean().item()
+        else:
+            # H shape: (s, s)
+            pf = H.sum(dim=0).abs().max().item()
+            pb = H.sum(dim=1).abs().max().item()
+            cf = composite.sum(dim=0).abs().max().item()
+            cb = composite.sum(dim=1).abs().max().item()
+
+        per_layer_fwd.append(pf)
+        per_layer_bwd.append(pb)
+        composite_fwd.append(cf)
+        composite_bwd.append(cb)
 
     return {
         "amax_fwd": composite_fwd[-1],
