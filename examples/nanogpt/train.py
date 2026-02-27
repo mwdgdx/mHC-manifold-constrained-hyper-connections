@@ -994,10 +994,18 @@ try:
 
         if iter_num % log_interval == 0 and master_process:
             loss_item = loss.item() * gradient_accumulation_steps
-            print(
-                f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
-                f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
-            )
+            amax_step = compute_amax() if wandb_log_amax else None
+            if amax_step is not None:
+                print(
+                    f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
+                    f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}, "
+                    f"Amax fwd {amax_step['amax_fwd']:.2f} bwd {amax_step['amax_bwd']:.2f}"
+                )
+            else:
+                print(
+                    f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
+                    f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
+                )
             if wandb is not None:
                 log_dict = {
                     "train/loss": loss_item,
@@ -1007,6 +1015,10 @@ try:
                     "perf/elapsed_s": time.time() - start_time,
                     "tokens/seen": iter_num * tokens_per_iter,
                 }
+                if amax_step is not None:
+                    log_dict["amax/fwd"] = amax_step["amax_fwd"]
+                    log_dict["amax/bwd"] = amax_step["amax_bwd"]
+                    log_dict["amax/max"] = amax_step["amax_max"]
                 if grad_norm is not None:
                     log_dict["train/grad_norm"] = grad_norm.item()
                 if device_type == "cuda":
