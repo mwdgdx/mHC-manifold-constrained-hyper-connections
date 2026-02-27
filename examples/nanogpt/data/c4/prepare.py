@@ -5,9 +5,9 @@ Uses GPT-2 BPE tokenizer (tiktoken). Downloads from HuggingFace,
 tokenizes, and saves as train.pt / val.pt.
 
 Usage:
-    python prepare.py              # default: ~2B train tokens (~16GB)
+    python prepare.py              # default: ~100M train tokens (~800MB)
     python prepare.py 500          # ~500M train tokens (~4GB)
-    python prepare.py 200          # ~200M tokens (quick test)
+    python prepare.py 2000         # ~2B tokens (~16GB)
 
 Requires: pip install datasets tiktoken
 """
@@ -21,8 +21,8 @@ from datasets import load_dataset
 
 LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TARGET_TRAIN_TOKENS = int(sys.argv[1]) * 1_000_000 if len(sys.argv) > 1 else 2_000_000_000
-TARGET_VAL_TOKENS = 10_000_000  # 10M tokens for validation
+TARGET_TRAIN_TOKENS = int(sys.argv[1]) * 1_000_000 if len(sys.argv) > 1 else 100_000_000
+TARGET_VAL_TOKENS = 5_000_000  # 5M tokens for validation
 
 
 def tokenize_split(dataset_iter, target_tokens, enc):

@@ -36,8 +36,8 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 
-# lr schedule
-warmup_iters = 200
+# lr schedule — Taylor uses 500 warmup steps
+warmup_iters = 500
 lr_decay_iters = 5000
 min_lr = 1e-5
 

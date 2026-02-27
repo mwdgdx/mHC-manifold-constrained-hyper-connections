@@ -483,7 +483,7 @@ elif dataset == "c4":
 
     train_data = torch.load(train_pt, weights_only=True)
     val_data = torch.load(val_pt, weights_only=True)
-    vocab_size = 50304  # GPT-2 BPE (50257 padded)
+    vocab_size = 50257  # GPT-2 BPE (exact, no padding)
 
     if master_process:
         print(f"C4 (GPT-2 BPE): vocab_size={vocab_size}")
