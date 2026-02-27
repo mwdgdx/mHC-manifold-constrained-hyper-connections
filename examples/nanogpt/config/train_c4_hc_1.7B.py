@@ -19,8 +19,10 @@ n_embd = 2048
 dropout = 0.0
 bias = False
 
-# training — Taylor uses batch_size ~8 per GPU for 32-layer 1.7B
-batch_size = 4
+# training — Taylor uses batch_size=8 per GPU for 32-layer 1.7B
+# With 8 GPUs, grad_accum=8 gets divided by 8 → 1 per GPU
+# Effective: 8 × 8 × 1024 = 65,536 tokens/step
+batch_size = 8
 gradient_accumulation_steps = 8
 max_iters = 5000
 eval_interval = 250
