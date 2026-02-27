@@ -742,6 +742,20 @@ def compute_amax():
         composite_fwd.append(cf)
         composite_bwd.append(cb)
 
+    # diagnostic: print per-layer alpha scales and H_res stats
+    if master_process:
+        scales = []
+        for block in raw_model.transformer.h:
+            for name, hc in [("attn", block.hc_attn), ("mlp", block.hc_mlp)]:
+                if isinstance(hc, HyperConnections) and hasattr(hc, 'dynamic_alpha_scale'):
+                    scales.append(hc.dynamic_alpha_scale.item())
+        if scales:
+            print(f"  HC dynamic_alpha_scale: min={min(scales):.4f} max={max(scales):.4f} mean={sum(scales)/len(scales):.4f}")
+        top5_fwd = sorted(enumerate(per_layer_fwd), key=lambda x: -x[1])[:5]
+        print(f"  Top-5 per-layer fwd Amax: {[(i, f'{v:.3f}') for i, v in top5_fwd]}")
+        top5_bwd = sorted(enumerate(per_layer_bwd), key=lambda x: -x[1])[:5]
+        print(f"  Top-5 per-layer bwd Amax: {[(i, f'{v:.3f}') for i, v in top5_bwd]}")
+
     return {
         "amax_fwd": composite_fwd[-1],
         "amax_bwd": composite_bwd[-1],
