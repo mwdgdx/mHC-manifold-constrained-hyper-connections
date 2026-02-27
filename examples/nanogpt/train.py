@@ -95,6 +95,7 @@ ns_eps = 1e-7
 ns_coeffs = (3.0, -3.2, 1.2)
 mhc_residual_identity_mix = False
 mhc_residual_alpha = 0.01
+hc_static_only = False  # disable input-dependent dynamic alpha (match original HC paper)
 
 # value residual config
 v_residual = False
