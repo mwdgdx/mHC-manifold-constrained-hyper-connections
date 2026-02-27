@@ -472,6 +472,23 @@ if dataset == "shakespeare_char":
         print(f"Shakespeare char-level: vocab_size={vocab_size}")
         print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
 
+elif dataset == "c4":
+    train_pt = os.path.join(data_dir, "train.pt")
+    val_pt = os.path.join(data_dir, "val.pt")
+
+    if not os.path.exists(train_pt):
+        raise FileNotFoundError(
+            f"No train.pt in {data_dir}. Run: cd {data_dir} && python prepare.py"
+        )
+
+    train_data = torch.load(train_pt, weights_only=True)
+    val_data = torch.load(val_pt, weights_only=True)
+    vocab_size = 50304  # GPT-2 BPE (50257 padded)
+
+    if master_process:
+        print(f"C4 (GPT-2 BPE): vocab_size={vocab_size}")
+        print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
+
 elif dataset == "fineweb10B":
     # FineWeb10B: pretokenized GPT-2 shards
     # Format: 256 x int32 header, then uint16 tokens
