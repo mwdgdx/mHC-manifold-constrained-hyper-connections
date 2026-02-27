@@ -1,35 +1,65 @@
+"""
+Download and prepare TinyShakespeare for character-level training.
+
+Usage:
+    python prepare.py
+
+Creates train.pt and val.pt (90/10 split) plus meta.json with vocab info.
+"""
+
 import json
 import os
 import urllib.request
 
-import torch
+DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 
-data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
-data_dir = os.path.dirname(__file__)
-input_path = os.path.join(data_dir, "input.txt")
+def main():
+    input_path = os.path.join(LOCAL_DIR, "input.txt")
 
-if not os.path.exists(input_path):
-    urllib.request.urlretrieve(data_url, input_path)
+    if not os.path.exists(input_path):
+        print(f"Downloading TinyShakespeare to {input_path} ...")
+        urllib.request.urlretrieve(DATA_URL, input_path)
+    else:
+        print(f"Found {input_path}, skipping download.")
 
-with open(input_path, "r", encoding="utf-8") as f:
-    data = f.read()
+    with open(input_path, "r") as f:
+        text = f.read()
 
-chars = sorted(list(set(data)))
+    print(f"Text length: {len(text):,} characters")
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
+    chars = sorted(set(text))
+    vocab_size = len(chars)
+    print(f"Vocab size: {vocab_size} unique characters")
 
-encoded = torch.tensor([stoi[ch] for ch in data], dtype=torch.long)
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    itos = {i: ch for i, ch in enumerate(chars)}
 
-n = int(0.9 * len(encoded))
-train_data = encoded[:n]
-val_data = encoded[n:]
+    import torch
 
-torch.save(train_data, os.path.join(data_dir, "train.bin"))
-torch.save(val_data, os.path.join(data_dir, "val.bin"))
+    data = torch.tensor([stoi[ch] for ch in text], dtype=torch.int64)
 
-meta = {"vocab_size": len(chars), "itos": itos, "stoi": stoi}
+    n = len(data)
+    split = int(n * 0.9)
+    train_data = data[:split]
+    val_data = data[split:]
 
-with open(os.path.join(data_dir, "meta.json"), "w") as f:
-    json.dump(meta, f)
+    print(f"Train: {len(train_data):,} tokens, Val: {len(val_data):,} tokens")
+
+    torch.save(train_data, os.path.join(LOCAL_DIR, "train.pt"))
+    torch.save(val_data, os.path.join(LOCAL_DIR, "val.pt"))
+
+    meta = {
+        "vocab_size": vocab_size,
+        "itos": itos,
+        "stoi": stoi,
+    }
+    with open(os.path.join(LOCAL_DIR, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print("Done! Created train.pt, val.pt, meta.json")
+
+
+if __name__ == "__main__":
+    main()

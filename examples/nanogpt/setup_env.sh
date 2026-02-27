@@ -53,26 +53,39 @@ echo ""
 
 echo "--- [2/3] Dataset ---"
 
-_DATA_DIR="${_SETUP_ROOT}/data/fineweb10B"
+_SHAKE_DIR="${_SETUP_ROOT}/data/shakespeare_char"
+_FW_DIR="${_SETUP_ROOT}/data/fineweb10B"
 
-if ls "${_DATA_DIR}"/fineweb_train_*.bin &>/dev/null 2>&1; then
-    _N_SHARDS=$(ls "${_DATA_DIR}"/fineweb_train_*.bin 2>/dev/null | wc -l)
-    echo "  Found ${_N_SHARDS} training shard(s) in ${_DATA_DIR}."
+# Shakespeare char-level (tiny, ~1MB)
+if [ -f "${_SHAKE_DIR}/train.pt" ]; then
+    echo "  Shakespeare char-level: ready (${_SHAKE_DIR})"
 else
-    echo "  No training data found. The dataset is split into shards (~200MB each)."
+    echo "  Preparing Shakespeare char-level dataset..."
+    python "${_SHAKE_DIR}/prepare.py"
+fi
+
+# FineWeb10B (large, optional)
+if ls "${_FW_DIR}"/fineweb_train_*.bin &>/dev/null 2>&1; then
+    _N_SHARDS=$(ls "${_FW_DIR}"/fineweb_train_*.bin 2>/dev/null | wc -l)
+    echo "  FineWeb10B: found ${_N_SHARDS} training shard(s)."
+else
+    echo "  FineWeb10B: not downloaded (optional, needed for fineweb configs)."
     echo ""
-    echo "    9   shards = ~0.9B tokens, ~1.8 GB  (quick test, recommended to start)"
-    echo "    103 shards = ~10B tokens,  ~20 GB   (full dataset for real experiments)"
+    echo "    9   shards = ~0.9B tokens, ~1.8 GB  (quick test)"
+    echo "    103 shards = ~10B tokens,  ~20 GB   (full dataset)"
     echo ""
 
     if [[ "${1:-}" != "--skip" ]]; then
-        read -rp "  How many shards? [9]: " _N_SHARDS_DL
-        _N_SHARDS_DL="${_N_SHARDS_DL:-9}"
-        echo "  Downloading ${_N_SHARDS_DL} shard(s) from HuggingFace..."
-        python "${_DATA_DIR}/download.py" "${_N_SHARDS_DL}"
+        read -rp "  Download FineWeb10B? How many shards? [skip]: " _N_SHARDS_DL
+        if [ -n "${_N_SHARDS_DL}" ] && [ "${_N_SHARDS_DL}" != "skip" ]; then
+            echo "  Downloading ${_N_SHARDS_DL} shard(s) from HuggingFace..."
+            python "${_FW_DIR}/download.py" "${_N_SHARDS_DL}"
+        else
+            echo "  Skipped FineWeb10B download."
+        fi
     else
-        echo "  Skipped (--skip). Download manually before training:"
-        echo "    cd ${_DATA_DIR} && python download.py 9"
+        echo "  Skipped (--skip). Download manually if needed:"
+        echo "    cd ${_FW_DIR} && python download.py 9"
     fi
 fi
 echo ""
