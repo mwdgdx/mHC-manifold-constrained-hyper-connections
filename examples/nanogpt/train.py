@@ -741,6 +741,8 @@ def compute_amax():
         composite = H if i == 0 else (
             torch.matmul(composite, H) if is_per_token else composite @ H
         )
+        assert composite.shape[:-2] == H.shape[:-2], f"batch shape mismatch at layer {i}"
+        assert composite.shape[-1] == H.shape[-2], f"matmul dim mismatch at layer {i}: {composite.shape} vs {H.shape}"
 
         if is_per_token:
             # H shape: (B, seq, s_from, s_to)
