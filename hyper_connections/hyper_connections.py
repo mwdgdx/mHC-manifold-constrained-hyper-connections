@@ -139,13 +139,14 @@ def get_init_and_expand_reduce_stream_functions(
 
 
 class RMSNorm(Module):
-    def __init__(self, dim):
+    def __init__(self, dim, eps=1e-8):
         super().__init__()
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
     def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
 
 
 # main classes
@@ -291,10 +292,9 @@ class HyperConnections(Module):
             cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim=1)
         )
 
-        self.dynamic_alpha_fn = nn.Parameter(
-            torch.zeros(dim, num_residual_streams_fracs + num_input_views_fracs)
-        )
-        self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-2)
+        self.W_m = nn.Parameter(torch.zeros(dim, num_input_views_fracs))
+        self.W_r = nn.Parameter(torch.zeros(dim, num_residual_streams_fracs))
+        self.s_alpha = nn.Parameter(torch.ones(()) * 1e-2)
 
         # depth connection related (beta)
 
@@ -306,9 +306,9 @@ class HyperConnections(Module):
             dynamic_beta_shape = (
                 (dim,) if num_fracs == 1 else (dim, num_fracs)
             )  # preserve backwards compat
-            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
+            self.W_beta = nn.Parameter(torch.zeros(dynamic_beta_shape))
 
-            self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
+            self.s_beta = nn.Parameter(torch.ones(()) * 1e-2)
 
         # dropouts
 
@@ -462,8 +462,9 @@ class HyperConnections(Module):
 
         # alpha for weighted sum of residuals going into branch
 
-        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
-        dynamic_alpha = wc_weight * self.dynamic_alpha_scale
+        W_alpha = cat([self.W_m, self.W_r], dim=-1)
+        wc_weight = self.act(normed @ W_alpha)
+        dynamic_alpha = wc_weight * self.s_alpha
 
         static_alpha = rearrange(self.static_alpha, "(f s) d -> f s d", s=streams)
 
@@ -482,12 +483,12 @@ class HyperConnections(Module):
         beta = None
 
         if self.add_branch_out_to_residual:
-            dc_weight = self.act(normed @ self.dynamic_beta_fn)
+            dc_weight = self.act(normed @ self.W_beta)
 
             if not self.has_fracs:
                 dc_weight = rearrange(dc_weight, "... -> ... 1")
 
-            dynamic_beta = dc_weight * self.dynamic_beta_scale
+            dynamic_beta = dc_weight * self.s_beta
 
             static_beta = rearrange(self.static_beta, "... (s f) -> ... s f", s=streams)
 

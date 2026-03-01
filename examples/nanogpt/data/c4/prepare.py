@@ -21,7 +21,7 @@ from datasets import load_dataset
 
 LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TARGET_TRAIN_TOKENS = int(sys.argv[1]) * 1_000_000 if len(sys.argv) > 1 else 100_000_000
+TARGET_TRAIN_TOKENS = int(sys.argv[1]) * 1_000_000 if len(sys.argv) > 1 else 500_000_000
 TARGET_VAL_TOKENS = 5_000_000  # 5M tokens for validation
 
 

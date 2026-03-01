@@ -266,6 +266,11 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    # HC dynamic parameters that should have weight decay per the HC paper
+    # (Section 4: "The static component does not utilize weight decay,
+    #  whereas the dynamic component does.")
+    HC_DYNAMIC_PARAMS = {"W_m", "W_r", "W_beta"}
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         decay = set()
         no_decay = set()
@@ -277,6 +282,8 @@ class GPT(nn.Module):
                 if param_name.endswith("bias"):
                     no_decay.add(full_name)
                 elif param_name.endswith("weight") and isinstance(module, nn.Linear):
+                    decay.add(full_name)
+                elif param_name in self.HC_DYNAMIC_PARAMS:
                     decay.add(full_name)
                 else:
                     no_decay.add(full_name)
@@ -293,6 +300,16 @@ class GPT(nn.Module):
 
         assert len(decay & no_decay) == 0
         assert len(param_dict.keys() - (decay | no_decay | lamb_params)) == 0
+
+        hc_decay = sorted(pn for pn in decay if "hc_attn." in pn or "hc_mlp." in pn)
+        hc_no_decay = sorted(pn for pn in no_decay if "hc_attn." in pn or "hc_mlp." in pn)
+        if hc_decay or hc_no_decay:
+            print(f"HC params with weight_decay ({len(hc_decay)}):")
+            for pn in hc_decay:
+                print(f"  {pn}  {tuple(param_dict[pn].shape)}")
+            print(f"HC params without weight_decay ({len(hc_no_decay)}):")
+            for pn in hc_no_decay:
+                print(f"  {pn}  {tuple(param_dict[pn].shape)}")
 
         optim_groups = [
             {
