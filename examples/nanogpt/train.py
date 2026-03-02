@@ -762,19 +762,73 @@ def compute_amax():
         composite_fwd.append(cf)
         composite_bwd.append(cb)
 
-    # diagnostic: print per-layer alpha scales and H_res stats
+    # Decompose H_res into static vs dynamic contributions per layer
+    static_frob = []
+    static_row_sum = []
+    static_col_sum = []
+    dynamic_row_sum = []
+    dynamic_col_sum = []
+
+    for i, hc in enumerate(hc_layers):
+        nv = getattr(hc, 'num_input_views', 1) * getattr(hc, 'num_fracs', 1)
+        if hc.mhc:
+            # mHC: H_res is fully static (Sinkhorn), no meaningful static/dynamic split
+            static_frob.append(0.0)
+            static_row_sum.append(per_layer_bwd[i])
+            static_col_sum.append(per_layer_fwd[i])
+            dynamic_row_sum.append(0.0)
+            dynamic_col_sum.append(0.0)
+        else:
+            sa = hc.static_alpha.data.float()
+            sa_r = sa[:, nv:]  # (s, s) — residual-to-residual static part
+            s = hc.num_residual_streams
+            eye = torch.eye(s, device=sa_r.device, dtype=sa_r.dtype)
+            static_frob.append(torch.norm(sa_r - eye, p='fro').item())
+            static_row_sum.append(sa_r.abs().sum(dim=-1).max().item())
+            static_col_sum.append(sa_r.abs().sum(dim=-2).max().item())
+
+            H = h_res_list[i]
+            dyn = H - sa_r  # broadcast: (B, seq, s, s) - (s, s) for per-token
+            if is_per_token:
+                dynamic_row_sum.append(dyn.abs().sum(dim=-1).max(dim=-1).values.mean().item())
+                dynamic_col_sum.append(dyn.abs().sum(dim=-2).max(dim=-1).values.mean().item())
+            else:
+                dynamic_row_sum.append(dyn.abs().sum(dim=-1).max().item())
+                dynamic_col_sum.append(dyn.abs().sum(dim=-2).max().item())
+
+    # Collect s_alpha / s_beta per layer
+    s_alpha_vals = []
+    s_beta_vals = []
+    static_alpha_diag_mean = []
+    static_alpha_offdiag_mean = []
+    for hc in hc_layers:
+        if hasattr(hc, 's_alpha'):
+            s_alpha_vals.append(hc.s_alpha.item())
+        if hasattr(hc, 's_beta'):
+            s_beta_vals.append(hc.s_beta.item())
+        if not hc.mhc and hasattr(hc, 'static_alpha'):
+            nv = getattr(hc, 'num_input_views', 1) * getattr(hc, 'num_fracs', 1)
+            sa_r = hc.static_alpha.data.float()[:, nv:]
+            s = hc.num_residual_streams
+            eye = torch.eye(s, device=sa_r.device, dtype=sa_r.dtype)
+            diag = sa_r.diag().mean().item()
+            offdiag = (sa_r - sa_r.diag().diag()).abs().mean().item()
+            static_alpha_diag_mean.append(diag)
+            static_alpha_offdiag_mean.append(offdiag)
+
     if master_process:
-        scales = []
-        for block in raw_model.transformer.h:
-            for name, hc in [("attn", block.hc_attn), ("mlp", block.hc_mlp)]:
-                if isinstance(hc, HyperConnections) and hasattr(hc, 's_alpha'):
-                    scales.append(hc.s_alpha.item())
-        if scales:
-            print(f"  HC s_alpha: min={min(scales):.4f} max={max(scales):.4f} mean={sum(scales)/len(scales):.4f}")
+        if s_alpha_vals:
+            print(f"  s_alpha: min={min(s_alpha_vals):.4f} max={max(s_alpha_vals):.4f} mean={sum(s_alpha_vals)/len(s_alpha_vals):.4f}")
+        if s_beta_vals:
+            print(f"  s_beta:  min={min(s_beta_vals):.4f} max={max(s_beta_vals):.4f} mean={sum(s_beta_vals)/len(s_beta_vals):.4f}")
         top5_fwd = sorted(enumerate(per_layer_fwd), key=lambda x: -x[1])[:5]
-        print(f"  Top-5 per-layer fwd Amax: {[(i, f'{v:.3f}') for i, v in top5_fwd]}")
+        print(f"  Top-5 per-layer fwd: {[(i, f'{v:.3f}') for i, v in top5_fwd]}")
         top5_bwd = sorted(enumerate(per_layer_bwd), key=lambda x: -x[1])[:5]
-        print(f"  Top-5 per-layer bwd Amax: {[(i, f'{v:.3f}') for i, v in top5_bwd]}")
+        print(f"  Top-5 per-layer bwd: {[(i, f'{v:.3f}') for i, v in top5_bwd]}")
+        top5_static = sorted(enumerate(static_frob), key=lambda x: -x[1])[:5]
+        print(f"  Top-5 static ||A_r-I||_F: {[(i, f'{v:.4f}') for i, v in top5_static]}")
+        top5_dyn = sorted(enumerate(dynamic_row_sum), key=lambda x: -x[1])[:5]
+        print(f"  Top-5 dynamic row sum: {[(i, f'{v:.4f}') for i, v in top5_dyn]}")
 
     return {
         "amax_fwd": composite_fwd[-1],
@@ -784,6 +838,15 @@ def compute_amax():
         "per_layer_bwd": per_layer_bwd,
         "composite_fwd": composite_fwd,
         "composite_bwd": composite_bwd,
+        "static_frob": static_frob,
+        "static_row_sum": static_row_sum,
+        "static_col_sum": static_col_sum,
+        "dynamic_row_sum": dynamic_row_sum,
+        "dynamic_col_sum": dynamic_col_sum,
+        "s_alpha_vals": s_alpha_vals,
+        "s_beta_vals": s_beta_vals,
+        "static_alpha_diag_mean": static_alpha_diag_mean,
+        "static_alpha_offdiag_mean": static_alpha_offdiag_mean,
     }
 
 
@@ -917,18 +980,46 @@ try:
                     eval_log["amax/fwd"] = amax_result["amax_fwd"]
                     eval_log["amax/bwd"] = amax_result["amax_bwd"]
                     eval_log["amax/max"] = amax_result["amax_max"]
+                    eval_log["amax/static_frob_max"] = max(amax_result["static_frob"])
+                    eval_log["amax/static_row_sum_max"] = max(amax_result["static_row_sum"])
+                    eval_log["amax/dynamic_row_sum_max"] = max(amax_result["dynamic_row_sum"])
+                    if amax_result["s_alpha_vals"]:
+                        eval_log["hc/s_alpha_min"] = min(amax_result["s_alpha_vals"])
+                        eval_log["hc/s_alpha_max"] = max(amax_result["s_alpha_vals"])
+                        eval_log["hc/s_alpha_mean"] = sum(amax_result["s_alpha_vals"]) / len(amax_result["s_alpha_vals"])
+                    if amax_result["s_beta_vals"]:
+                        eval_log["hc/s_beta_min"] = min(amax_result["s_beta_vals"])
+                        eval_log["hc/s_beta_max"] = max(amax_result["s_beta_vals"])
+                        eval_log["hc/s_beta_mean"] = sum(amax_result["s_beta_vals"]) / len(amax_result["s_beta_vals"])
+                    if amax_result["static_alpha_diag_mean"]:
+                        eval_log["hc/static_alpha_diag_mean"] = sum(amax_result["static_alpha_diag_mean"]) / len(amax_result["static_alpha_diag_mean"])
+                        eval_log["hc/static_alpha_offdiag_mean"] = sum(amax_result["static_alpha_offdiag_mean"]) / len(amax_result["static_alpha_offdiag_mean"])
                 wandb.log(eval_log, step=iter_num)
                 if amax_result is not None:
                     amax_table = wandb.Table(
-                        columns=["layer", "single_fwd", "single_bwd", "composite_fwd", "composite_bwd"]
+                        columns=[
+                            "layer", "single_fwd", "single_bwd",
+                            "composite_fwd", "composite_bwd",
+                            "static_frob", "static_row_sum", "static_col_sum",
+                            "dynamic_row_sum", "dynamic_col_sum",
+                            "s_alpha", "s_beta",
+                        ]
                     )
                     for idx in range(len(amax_result["per_layer_fwd"])):
+                        sa = amax_result["s_alpha_vals"][idx] if idx < len(amax_result["s_alpha_vals"]) else 0.0
+                        sb = amax_result["s_beta_vals"][idx] if idx < len(amax_result["s_beta_vals"]) else 0.0
                         amax_table.add_data(
                             idx,
                             amax_result["per_layer_fwd"][idx],
                             amax_result["per_layer_bwd"][idx],
                             amax_result["composite_fwd"][idx],
                             amax_result["composite_bwd"][idx],
+                            amax_result["static_frob"][idx],
+                            amax_result["static_row_sum"][idx],
+                            amax_result["static_col_sum"][idx],
+                            amax_result["dynamic_row_sum"][idx],
+                            amax_result["dynamic_col_sum"][idx],
+                            sa, sb,
                         )
                     wandb.log({"amax/per_layer": amax_table}, step=iter_num)
                 if wandb_log_layer_cosine and layer_cosine is not None:
@@ -1021,6 +1112,20 @@ try:
                     log_dict["amax/fwd"] = amax_step["amax_fwd"]
                     log_dict["amax/bwd"] = amax_step["amax_bwd"]
                     log_dict["amax/max"] = amax_step["amax_max"]
+                    log_dict["amax/static_frob_max"] = max(amax_step["static_frob"])
+                    log_dict["amax/static_row_sum_max"] = max(amax_step["static_row_sum"])
+                    log_dict["amax/dynamic_row_sum_max"] = max(amax_step["dynamic_row_sum"])
+                    if amax_step["s_alpha_vals"]:
+                        log_dict["hc/s_alpha_min"] = min(amax_step["s_alpha_vals"])
+                        log_dict["hc/s_alpha_max"] = max(amax_step["s_alpha_vals"])
+                        log_dict["hc/s_alpha_mean"] = sum(amax_step["s_alpha_vals"]) / len(amax_step["s_alpha_vals"])
+                    if amax_step["s_beta_vals"]:
+                        log_dict["hc/s_beta_min"] = min(amax_step["s_beta_vals"])
+                        log_dict["hc/s_beta_max"] = max(amax_step["s_beta_vals"])
+                        log_dict["hc/s_beta_mean"] = sum(amax_step["s_beta_vals"]) / len(amax_step["s_beta_vals"])
+                    if amax_step["static_alpha_diag_mean"]:
+                        log_dict["hc/static_alpha_diag_mean"] = sum(amax_step["static_alpha_diag_mean"]) / len(amax_step["static_alpha_diag_mean"])
+                        log_dict["hc/static_alpha_offdiag_mean"] = sum(amax_step["static_alpha_offdiag_mean"]) / len(amax_step["static_alpha_offdiag_mean"])
                 if grad_norm is not None:
                     log_dict["train/grad_norm"] = grad_norm.item()
                 if device_type == "cuda":

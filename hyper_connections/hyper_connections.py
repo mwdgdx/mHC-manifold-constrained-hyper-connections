@@ -292,8 +292,8 @@ class HyperConnections(Module):
             cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim=1)
         )
 
-        self.W_m = nn.Parameter(torch.zeros(dim, num_input_views_fracs))
-        self.W_r = nn.Parameter(torch.zeros(dim, num_residual_streams_fracs))
+        self.W_m = nn.Parameter(torch.randn(dim, num_input_views_fracs) * 0.02)
+        self.W_r = nn.Parameter(torch.randn(dim, num_residual_streams_fracs) * 0.02)
         self.s_alpha = nn.Parameter(torch.ones(()) * 1e-2)
 
         # depth connection related (beta)

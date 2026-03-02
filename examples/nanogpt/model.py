@@ -222,10 +222,14 @@ class GPT(nn.Module):
 
         self.apply(self._init_weights)
 
+        # HC paper Section 4: scale output projection std by sqrt(n) where n = expansion rate,
+        # to maintain output variance when n streams are summed at the end.
+        hc_output_scale = math.sqrt(config.hc_num_streams) if not config.hc_disable else 1.0
         for name, param in self.named_parameters():
             if name.endswith("c_proj.weight"):
                 nn.init.normal_(
-                    param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                    param, mean=0.0,
+                    std=0.02 * hc_output_scale / math.sqrt(2 * config.n_layer),
                 )
 
     def _init_weights(self, module):
@@ -266,10 +270,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    # HC dynamic parameters that should have weight decay per the HC paper
-    # (Section 4: "The static component does not utilize weight decay,
-    #  whereas the dynamic component does.")
-    HC_DYNAMIC_PARAMS = {"W_m", "W_r", "W_beta"}
+    HC_DYNAMIC_PARAMS = set()
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         decay = set()
