@@ -38,14 +38,14 @@ else
 fi
 
 _MISSING=""
-for _pkg in torch einops numpy wandb; do
+for _pkg in torch einops numpy wandb tiktoken datasets; do
     python -c "import $_pkg" 2>/dev/null || _MISSING="$_MISSING $_pkg"
 done
 if [ -n "$_MISSING" ]; then
     echo "  Installing missing packages:${_MISSING} ..."
     pip install ${_MISSING} 2>&1 | tail -3
 else
-    echo "  torch, einops, numpy, wandb: OK."
+    echo "  torch, einops, numpy, wandb, tiktoken, datasets: OK."
 fi
 echo ""
 
@@ -54,6 +54,7 @@ echo ""
 echo "--- [2/3] Dataset ---"
 
 _SHAKE_DIR="${_SETUP_ROOT}/data/shakespeare_char"
+_C4_DIR="${_SETUP_ROOT}/data/c4"
 _FW_DIR="${_SETUP_ROOT}/data/fineweb10B"
 
 # Shakespeare char-level (tiny, ~1MB)
@@ -62,6 +63,14 @@ if [ -f "${_SHAKE_DIR}/train.pt" ]; then
 else
     echo "  Preparing Shakespeare char-level dataset..."
     python "${_SHAKE_DIR}/prepare.py"
+fi
+
+# C4 (default 500M tokens, ~4GB)
+if [ -f "${_C4_DIR}/train.pt" ]; then
+    echo "  C4: ready (${_C4_DIR})"
+else
+    echo "  Preparing C4 dataset (500M tokens, may take a few minutes)..."
+    python "${_C4_DIR}/prepare.py"
 fi
 
 # FineWeb10B (large, optional)
@@ -137,5 +146,8 @@ echo "Run experiments:"
 echo "  ./run_all.sh          # 6-layer ablations"
 echo "  ./run_all.sh --48l    # 48-layer ablations"
 echo "  ./run_all.sh --all    # all"
+echo ""
+echo "  # C4 1.7B HC (8x GPU):"
+echo "  torchrun --standalone --nproc_per_node=8 train.py config/train_c4_hc_1.7B.py gradient_accumulation_steps=32 batch_size=2"
 echo "========================="
 echo ""
