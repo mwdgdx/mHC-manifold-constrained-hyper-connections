@@ -1071,6 +1071,25 @@ try:
         if grad_clip != 0.0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
+
+            # measure HC-specific grad norms before clipping
+            hc_static_grad_norm = 0.0
+            hc_dynamic_grad_norm = 0.0
+            other_grad_norm = 0.0
+            for name, p in raw_model.named_parameters():
+                if p.grad is None:
+                    continue
+                g2 = p.grad.float().norm().item() ** 2
+                if "static_alpha" in name or "static_beta" in name:
+                    hc_static_grad_norm += g2
+                elif any(k in name for k in ("s_alpha", "s_beta", "W_m", "W_r", "W_beta")):
+                    hc_dynamic_grad_norm += g2
+                else:
+                    other_grad_norm += g2
+            hc_static_grad_norm = hc_static_grad_norm ** 0.5
+            hc_dynamic_grad_norm = hc_dynamic_grad_norm ** 0.5
+            other_grad_norm = other_grad_norm ** 0.5
+
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 raw_model.parameters(), grad_clip
             )
@@ -1128,6 +1147,12 @@ try:
                         log_dict["hc/static_alpha_offdiag_mean"] = sum(amax_step["static_alpha_offdiag_mean"]) / len(amax_step["static_alpha_offdiag_mean"])
                 if grad_norm is not None:
                     log_dict["train/grad_norm"] = grad_norm.item()
+                    log_dict["train/grad_norm_pre_clip"] = (hc_static_grad_norm**2 + hc_dynamic_grad_norm**2 + other_grad_norm**2) ** 0.5
+                    log_dict["train/grad_norm_hc_static"] = hc_static_grad_norm
+                    log_dict["train/grad_norm_hc_dynamic"] = hc_dynamic_grad_norm
+                    log_dict["train/grad_norm_other"] = other_grad_norm
+                    if grad_norm.item() > 0:
+                        log_dict["train/clip_ratio"] = grad_clip / grad_norm.item()
                 if device_type == "cuda":
                     log_dict["perf/max_mem_allocated_mb"] = (
                         torch.cuda.max_memory_allocated() / 1e6
