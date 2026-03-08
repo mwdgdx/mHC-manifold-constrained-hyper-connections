@@ -31,3 +31,4 @@ echo "=== All done at $(date) ==="
 echo "Logs:"
 echo "  HC:  logs/hc_${TIMESTAMP}.log"
 echo "  mHC: logs/mhc_${TIMESTAMP}.log"
+  

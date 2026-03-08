@@ -118,6 +118,7 @@ wandb_group = None
 wandb_log_layer_stats = True
 wandb_log_layer_cosine = True
 wandb_log_amax = True
+wandb_amax_profile_interval = 500
 
 # DDP backend: "nccl", "gloo", etc.
 # If NCCL fails, set NCCL_IB_DISABLE=1 or use backend="gloo"
@@ -723,44 +724,51 @@ def compute_amax():
             hc._collect_h_res = False
             hc.__dict__.pop('_last_h_res', None)
 
-    # H_res convention in this codebase: H[from, to]
-    #   einsum "s t, ... s d -> ... t d" — s is contracted (input), t is output
-    # Paper convention (standard matrix): M = H^T, so M[to, from]
-    #   paper "forward Amax"  = max|row sum of M| = max_t |Σ_s H[s,t]| = max|col sum of H|
-    #   paper "backward Amax" = max|col sum of M| = max_s |Σ_t H[s,t]| = max|row sum of H|
+    # Code stores H[from, to]; paper uses M = H^T where x_out = M @ x_in.
+    # Convert to paper convention so formulas match the paper directly.
+    # Forward: signal goes through M,   gain = ||M||_inf = max row sum  (inf-norm)
+    # Backward: gradient goes through M^T, gain = ||M^T||_inf = ||M||_1 = max col sum (1-norm)
 
     is_per_token = h_res_list[0].dim() > 2
+    _t = (-2, -1) if is_per_token else (0, 1)
+    M_list = [H.transpose(*_t).contiguous() for H in h_res_list]
 
-    per_layer_fwd = []
-    per_layer_bwd = []
-    composite_fwd = []
-    composite_bwd = []
-    composite = None
-
-    for i, H in enumerate(h_res_list):
-        composite = H if i == 0 else (
-            torch.matmul(composite, H) if is_per_token else composite @ H
-        )
-        assert composite.shape[:-2] == H.shape[:-2], f"batch shape mismatch at layer {i}"
-        assert composite.shape[-1] == H.shape[-2], f"matmul dim mismatch at layer {i}: {composite.shape} vs {H.shape}"
-
+    def _max_row_sum(mat):
+        """||M||_inf = max row sum — bounds forward signal gain (x_out = M @ x_in)."""
         if is_per_token:
-            # H shape: (B, seq, s_from, s_to)
-            pf = H.sum(dim=-2).abs().max(dim=-1).values.mean().item()
-            pb = H.sum(dim=-1).abs().max(dim=-1).values.mean().item()
-            cf = composite.sum(dim=-2).abs().max(dim=-1).values.mean().item()
-            cb = composite.sum(dim=-1).abs().max(dim=-1).values.mean().item()
-        else:
-            # H shape: (s, s)
-            pf = H.sum(dim=0).abs().max().item()
-            pb = H.sum(dim=1).abs().max().item()
-            cf = composite.sum(dim=0).abs().max().item()
-            cb = composite.sum(dim=1).abs().max().item()
+            return mat.sum(dim=-1).abs().max(dim=-1).values.mean().item()
+        return mat.sum(dim=-1).abs().max().item()
 
-        per_layer_fwd.append(pf)
-        per_layer_bwd.append(pb)
-        composite_fwd.append(cf)
-        composite_bwd.append(cb)
+    def _max_col_sum(mat):
+        """||M||_1 = max col sum — bounds backward gradient gain (g = M^T @ g_out)."""
+        if is_per_token:
+            return mat.sum(dim=-2).abs().max(dim=-1).values.mean().item()
+        return mat.sum(dim=-2).abs().max().item()
+
+    N = len(M_list)
+    per_layer_fwd = [_max_row_sum(M) for M in M_list]
+    per_layer_bwd = [_max_col_sum(M) for M in M_list]
+
+    # Forward at layer l: F_l = M_l @ ... @ M_0  (signal gain through layers 0..l)
+    composite_fwd = []
+    fwd = None
+    for i, M in enumerate(M_list):
+        fwd = M if i == 0 else (
+            torch.matmul(M, fwd) if is_per_token else M @ fwd
+        )
+        composite_fwd.append(_max_row_sum(fwd))
+
+    # Backward at layer l: B_l = M_{N-1} @ ... @ M_l  (gradient gain through layers l..N-1)
+    # Gradient goes through B_l^T, so gain = ||B_l^T||_inf = ||B_l||_1 = max col sum.
+    # Overlaps with forward at layer l (both include M_l), matching the paper.
+    composite_bwd = [0.0] * N
+    bwd = None
+    for i in range(N - 1, -1, -1):
+        M = M_list[i]
+        bwd = M if bwd is None else (
+            torch.matmul(bwd, M) if is_per_token else bwd @ M
+        )
+        composite_bwd[i] = _max_col_sum(bwd)
 
     # Decompose H_res into static vs dynamic contributions per layer
     static_frob = []
@@ -816,24 +824,30 @@ def compute_amax():
             static_alpha_diag_mean.append(diag)
             static_alpha_offdiag_mean.append(offdiag)
 
+    composite_fwd_max = max(composite_fwd)
+    composite_bwd_max = max(composite_bwd)
+
     if master_process:
         if s_alpha_vals:
             print(f"  s_alpha: min={min(s_alpha_vals):.4f} max={max(s_alpha_vals):.4f} mean={sum(s_alpha_vals)/len(s_alpha_vals):.4f}")
         if s_beta_vals:
             print(f"  s_beta:  min={min(s_beta_vals):.4f} max={max(s_beta_vals):.4f} mean={sum(s_beta_vals)/len(s_beta_vals):.4f}")
-        top5_fwd = sorted(enumerate(per_layer_fwd), key=lambda x: -x[1])[:5]
-        print(f"  Top-5 per-layer fwd: {[(i, f'{v:.3f}') for i, v in top5_fwd]}")
-        top5_bwd = sorted(enumerate(per_layer_bwd), key=lambda x: -x[1])[:5]
-        print(f"  Top-5 per-layer bwd: {[(i, f'{v:.3f}') for i, v in top5_bwd]}")
         top5_static = sorted(enumerate(static_frob), key=lambda x: -x[1])[:5]
         print(f"  Top-5 static ||A_r-I||_F: {[(i, f'{v:.4f}') for i, v in top5_static]}")
         top5_dyn = sorted(enumerate(dynamic_row_sum), key=lambda x: -x[1])[:5]
         print(f"  Top-5 dynamic row sum: {[(i, f'{v:.4f}') for i, v in top5_dyn]}")
+        print(f"  Composite fwd max across layers: {composite_fwd_max:.4f}")
+        print(f"  Composite bwd max across layers: {composite_bwd_max:.4f}")
+        print("  Per-layer composite (fwd | bwd):")
+        for i in range(N):
+            print(f"    layer {i:3d}: fwd={composite_fwd[i]:8.4f}  bwd={composite_bwd[i]:8.4f}")
 
     return {
         "amax_fwd": composite_fwd[-1],
-        "amax_bwd": composite_bwd[-1],
-        "amax_max": max(composite_fwd[-1], composite_bwd[-1]),
+        "amax_bwd": composite_bwd[0],
+        "amax_max": max(composite_fwd[-1], composite_bwd[0]),
+        "composite_fwd_max": composite_fwd_max,
+        "composite_bwd_max": composite_bwd_max,
         "per_layer_fwd": per_layer_fwd,
         "per_layer_bwd": per_layer_bwd,
         "composite_fwd": composite_fwd,
@@ -945,6 +959,7 @@ try:
             "wandb_log_layer_stats": wandb_log_layer_stats,
             "wandb_log_layer_cosine": wandb_log_layer_cosine,
             "wandb_log_amax": wandb_log_amax,
+            "wandb_amax_profile_interval": wandb_amax_profile_interval,
         },
         )
 
@@ -1131,9 +1146,22 @@ try:
                     log_dict["amax/fwd"] = amax_step["amax_fwd"]
                     log_dict["amax/bwd"] = amax_step["amax_bwd"]
                     log_dict["amax/max"] = amax_step["amax_max"]
+                    log_dict["amax/composite_fwd_max"] = amax_step["composite_fwd_max"]
+                    log_dict["amax/composite_bwd_max"] = amax_step["composite_bwd_max"]
                     log_dict["amax/static_frob_max"] = max(amax_step["static_frob"])
                     log_dict["amax/static_row_sum_max"] = max(amax_step["static_row_sum"])
                     log_dict["amax/dynamic_row_sum_max"] = max(amax_step["dynamic_row_sum"])
+                    if wandb_amax_profile_interval > 0 and iter_num % wandb_amax_profile_interval == 0:
+                        cfwd = amax_step["composite_fwd"]
+                        cbwd = amax_step["composite_bwd"]
+                        layers = list(range(len(cfwd)))
+                        log_dict[f"amax_profile/step_{iter_num}"] = wandb.plot.line_series(
+                            xs=layers,
+                            ys=[cfwd, cbwd],
+                            keys=["Forward Signal Gain", "Backward Gradient Gain"],
+                            title=f"Amax Profile (step {iter_num})",
+                            xname="Layer",
+                        )
                     if amax_step["s_alpha_vals"]:
                         log_dict["hc/s_alpha_min"] = min(amax_step["s_alpha_vals"])
                         log_dict["hc/s_alpha_max"] = max(amax_step["s_alpha_vals"])
